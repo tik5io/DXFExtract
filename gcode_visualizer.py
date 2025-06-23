@@ -1,3 +1,12 @@
+#gcode_visualizer.py
+"""
+This module provides a class for visualizing ISO G-code paths using Matplotlib. 
+It includes methods for parsing G-code, plotting the paths, and highlighting specific elements.
+It is designed to be used in a Jupyter notebook or any Python environment with Matplotlib installed
+and configured.
+"""
+
+
 import matplotlib.pyplot as plt
 import re
 import math

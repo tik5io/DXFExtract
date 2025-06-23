@@ -1,3 +1,12 @@
+#dxf_processor.py
+""" Module for processing DXF files, extracting entities, reversing segment directions,
+and generating ISO G-code.
+This module provides functionality to read DXF files, extract LINE, ARC, and CIRCLE entities,
+reverse the direction of segments, and generate ISO G-code based on the extracted entities.
+It includes error handling for file reading and entity extraction, and uses a Tkinter message box
+for user notifications.
+"""
+
 import ezdxf
 import math
 import sys

@@ -1,3 +1,11 @@
+#app_gui.py
+"""DXF to ISO G-code Viewer Application
+This application allows users to load a DXF file, visualize its entities, and generate ISO G-code.
+It provides a GUI for managing the order of segments, reversing their direction, and visualizing the
+generated G-code.
+"""
+
+
 import tkinter as tk
 from tkinter import scrolledtext, filedialog, messagebox, ttk
 import tkinter.font as tkfont
