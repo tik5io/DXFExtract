@@ -17,7 +17,7 @@ class GcodeVisualizer:
         self.ax.set_aspect('equal', adjustable='box')
 
         #self._legend_labels = set()
-        self.connection_tolerance = 1e-4 # Used for G00 jumps and now for arc start/end precision
+        self.connection_tolerance = 1e-3 # Used for G00 jumps and now for arc start/end precision
 
         self.plotted_elements = [] # Stores all plotted artists for reset/highlight
         self.gcode_line_map = {} # Maps G-code line index to plotted_elements index

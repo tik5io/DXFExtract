@@ -1,12 +1,3 @@
-#dxf_processor.py
-""" Module for processing DXF files, extracting entities, reversing segment directions,
-and generating ISO G-code.
-This module provides functionality to read DXF files, extract LINE, ARC, and CIRCLE entities,
-reverse the direction of segments, and generate ISO G-code based on the extracted entities.
-It includes error handling for file reading and entity extraction, and uses a Tkinter message box
-for user notifications.
-"""
-
 import ezdxf
 import math
 import sys
@@ -14,6 +5,8 @@ import copy
 import tkinter as tk
 from tkinter import messagebox
 import itertools
+import logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class DxfProcessor:
     """
@@ -22,7 +15,7 @@ class DxfProcessor:
     """
     def __init__(self, connection_tolerance=1e-4):
         self.connection_tolerance = connection_tolerance
-        self.unique_id_counter = itertools.count(1) # For generating unique IDs across runs
+        self.unique_id_counter = itertools.count(1)
 
     def extract_dxf_entities(self, dxf_filepath):
         """
@@ -40,12 +33,12 @@ class DxfProcessor:
             msp = doc.modelspace()
 
             for entity in msp:
-                entity_id = next(self.unique_id_counter) 
-                cloned_entity = entity.copy() 
+                entity_id = next(self.unique_id_counter)
+                cloned_entity = entity.copy()
 
                 if entity.dxftype() == 'LINE':
-                    start_point = cloned_entity.dxf.start.xyz[:2] # X, Y only
-                    end_point = cloned_entity.dxf.end.xyz[:2]     # X, Y only
+                    start_point = (cloned_entity.dxf.start.x, cloned_entity.dxf.start.y)
+                    end_point = (cloned_entity.dxf.end.x, cloned_entity.dxf.end.y)
                     entities_data[entity_id] = {
                         'id': entity_id,
                         'type': 'LINE',
@@ -59,16 +52,19 @@ class DxfProcessor:
                         'id_display': f"L{entity_id}: ({start_point[0]:.2f},{start_point[1]:.2f})->({end_point[0]:.2f},{end_point[1]:.2f})"
                     }
                 elif entity.dxftype() == 'ARC':
-                    center = cloned_entity.dxf.center.xyz[:2]
+                    center = cloned_entity.dxf.center.xyz[:2] # Still using .xyz[:2] here as dxf.center is Vec3
                     radius = cloned_entity.dxf.radius
                     start_angle_deg = cloned_entity.dxf.start_angle
                     end_angle_deg = cloned_entity.dxf.end_angle
 
-                    start_point = cloned_entity.start_point.xyz[:2]
-                    end_point = cloned_entity.end_point.xyz[:2]
+                    ezdxf_center_vec2 = ezdxf.math.Vec2(center[0], center[1])
                     
-                    # Determine arc direction for G-code (G02=CW, G03=CCW)
-                    # Normalize angles to [0, 360)
+                    start_point_vec2 = ezdxf_center_vec2 + ezdxf.math.Vec2.from_deg_angle(start_angle_deg, radius)
+                    end_point_vec2 = ezdxf_center_vec2 + ezdxf.math.Vec2.from_deg_angle(end_angle_deg, radius)
+
+                    start_point = (start_point_vec2.x, start_point_vec2.y)
+                    end_point = (end_point_vec2.x, end_point_vec2.y)
+
                     norm_start_angle = start_angle_deg % 360
                     norm_end_angle = end_angle_deg % 360
 
@@ -80,11 +76,25 @@ class DxfProcessor:
                             is_clockwise = False
                     elif norm_start_angle > norm_end_angle:
                         if (norm_start_angle - norm_end_angle) < 180:
-                             is_clockwise = True
+                            is_clockwise = True
                         else:
                             is_clockwise = False
-                    else: # start_angle == end_angle
-                        is_clockwise = False # Default to CCW for full circles initially
+                    else: # start_angle == end_angle - This is where the is_full_circle check was
+                        # Check for full circle by comparing start and end angles, allowing for float tolerance
+                        if math.isclose(start_angle_deg % 360, end_angle_deg % 360, abs_tol=1e-6) and radius > 0:
+                            # If angles are effectively the same, and it's not a zero-radius point, it's a full circle.
+                            # Full circles are usually generated counter-clockwise (G03) for convention,
+                            # or clockwise (G02) if start and end points are identical for a full sweep.
+                            # Given how G-code works (end point = start point for full circle), G03 is common.
+                            is_clockwise = False # Default for full circles
+                            logging.debug(f"Detected Full Circle Arc (ID: {entity_id}) by angle comparison. Start/End points will be identical.")
+                        else:
+                            # This path shouldn't typically be hit for normal arcs if angles are distinct.
+                            # It handles cases like (0,0) or small segments if start and end angles are identical but not a full circle
+                            is_clockwise = False # Default to CCW in ambiguous cases
+                    
+                    # Removed: if cloned_entity.is_full_circle:
+                    # The check above with math.isclose handles this now.
 
                     entities_data[entity_id] = {
                         'id': entity_id,
@@ -103,8 +113,8 @@ class DxfProcessor:
                         'original_id': entity_id,
                         'id_display': f"A{entity_id}: R{radius:.2f} ({start_point[0]:.2f},{start_point[1]:.2f})->({end_point[0]:.2f},{end_point[1]:.2f})"
                     }
-                elif entity.dxftype() == 'CIRCLE': # <-- Added CIRCLE handling
-                    center = cloned_entity.dxf.center.xyz[:2]
+                elif entity.dxftype() == 'CIRCLE':
+                    center = (cloned_entity.dxf.center.x, cloned_entity.dxf.center.y)
                     radius = cloned_entity.dxf.radius
                     entities_data[entity_id] = {
                         'id': entity_id,
@@ -114,11 +124,11 @@ class DxfProcessor:
                             'center': center,
                             'radius': radius
                         },
-                        'reversed': False, # Not directly applicable, but kept for consistency
+                        'reversed': False,
                         'original_id': entity_id,
                         'id_display': f"C{entity_id}: R{radius:.2f} (Center:{center[0]:.2f},{center[1]:.2f})"
                     }
-            
+                
             messagebox.showinfo("DXF Chargé", f"{len(entities_data)} entités extraites du DXF.")
             return entities_data
 
@@ -154,17 +164,26 @@ class DxfProcessor:
             entity.dxf.start_angle = entity.dxf.end_angle
             entity.dxf.end_angle = start_angle_orig
 
-            entity_data['coords']['start_point'] = (entity.start_point.x, entity.start_point.y)
-            entity_data['coords']['end_point'] = (entity.end_point.x, entity.end_point.y)
+            center = entity_data['coords']['center'] 
+            radius = entity_data['coords']['radius']
+            ezdxf_center_vec2 = ezdxf.math.Vec2(center[0], center[1])
+
+            entity_data['coords']['start_point'] = (ezdxf_center_vec2 + 
+                                                    ezdxf.math.Vec2.from_deg_angle(entity.dxf.start_angle, radius)).x, \
+                                                   (ezdxf_center_vec2 + 
+                                                    ezdxf.math.Vec2.from_deg_angle(entity.dxf.start_angle, radius)).y
+            entity_data['coords']['end_point'] = (ezdxf_center_vec2 + 
+                                                  ezdxf.math.Vec2.from_deg_angle(entity.dxf.end_angle, radius)).x, \
+                                                 (ezdxf_center_vec2 + 
+                                                  ezdxf.math.Vec2.from_deg_angle(entity.dxf.end_angle, radius)).y
+            
             entity_data['coords']['start_angle'] = entity.dxf.start_angle
             entity_data['coords']['end_angle'] = entity.dxf.end_angle
             
             entity_data['coords']['is_clockwise'] = not entity_data['coords']['is_clockwise']
-        # No reversal needed for CIRCLE
 
         entity_data['reversed'] = not entity_data['reversed']
         
-        # Update id_display to reflect the new direction/reversal
         if entity_data['type'] == 'LINE':
             current_start_pt = entity_data['coords']['start_point']
             current_end_pt = entity_data['coords']['end_point']
@@ -181,15 +200,12 @@ class DxfProcessor:
 
 
     def _get_best_candidate_info(self, reference_point, entities_to_search):
-        """
-        Internal helper to find the best next segment for automated path generation.
-        """
         best_match_id = None
         best_should_reverse = False
         min_distance = float('inf')
 
         for entity_id, data in entities_to_search.items():
-            if data['type'] == 'CIRCLE': # Circles are not connectable in this context
+            if data['type'] == 'CIRCLE':
                 continue
 
             segment_start = data['coords']['start_point']
@@ -213,11 +229,7 @@ class DxfProcessor:
 
         return (best_match_id, best_should_reverse, min_distance)
 
-    def generate_gcode(self, ordered_segments_data_list, isolated_circles_data_list, initial_start_point=(0.0, 0.0)): # <-- Added isolated_circles_data_list
-        """
-        Generates ISO G-code from an ordered list of segment data and a list of isolated circles.
-        Returns the G-code as a string and a map from G-code line index to DXF segment ID.
-        """
+    def generate_gcode(self, ordered_segments_data_list, isolated_circles_data_list, initial_start_point=(0.0, 0.0)):
         gcode_lines = []
         dxf_segment_id_map = {}
         current_x, current_y = initial_start_point
@@ -251,7 +263,7 @@ class DxfProcessor:
 
             if segment_data['type'] == 'LINE':
                 gcode_lines.append(f"N{gcode_line_idx*10} G01 X{segment_end_x:.4f} Y{segment_end_y:.4f} ; LINE DXF ID: {dxf_original_id}")
-                dxf_segment_id_map[gcode_line_idx] = dxf_original_id
+                dxf_segment_id_map[gcode_line_idx] = f"L{dxf_original_id}"
                 gcode_line_idx += 1
 
             elif segment_data['type'] == 'ARC':
@@ -264,12 +276,12 @@ class DxfProcessor:
                 command = "G02" if segment_data['coords']['is_clockwise'] else "G03"
                 
                 gcode_lines.append(f"N{gcode_line_idx*10} {command} X{segment_end_x:.4f} Y{segment_end_y:.4f} I{i_offset:.4f} J{j_offset:.4f} ; ARC DXF ID: {dxf_original_id}")
-                dxf_segment_id_map[gcode_line_idx] = dxf_original_id
+                dxf_segment_id_map[gcode_line_idx] = f"A{dxf_original_id}"
                 gcode_line_idx += 1
             
             current_x, current_y = segment_end_x, segment_end_y
 
-        # --- G-code for Isolated Circles --- <-- Added
+        # --- G-code for Isolated Circles ---
         if isolated_circles_data_list:
             gcode_lines.append(f"N{gcode_line_idx*10} ; Start of DXF Isolated Circles")
             dxf_segment_id_map[gcode_line_idx] = "PATH_COMMENT_CIRCLES"
@@ -281,28 +293,23 @@ class DxfProcessor:
                 radius = circle_data['coords']['radius']
                 dxf_original_id = circle_data['original_id']
 
-                # Pick a start point for the circle (e.g., at 0 degrees, to the right of the center)
                 start_x_circle = center_x + radius
                 start_y_circle = center_y
 
-                # Move to the start point of the circle (G00)
                 gcode_lines.append(f"N{gcode_line_idx*10} G00 X{start_x_circle:.4f} Y{start_y_circle:.4f} ; Jump to CIRCLE DXF ID: {dxf_original_id}")
                 dxf_segment_id_map[gcode_line_idx] = f"JUMP_TO_CIRCLE_{dxf_original_id}"
                 gcode_line_idx += 1
                 current_x, current_y = start_x_circle, start_y_circle
 
-                # Generate G02/G03 for a full circle. For a full circle, the end point is the same as the start point.
-                # I and J are relative offsets from the current point to the center.
                 i_offset = center_x - current_x
                 j_offset = center_y - current_y
 
-                # Assuming CCW for full circles by default, can be made configurable
-                gcode_lines.append(f"N{gcode_line_idx*10} G03 X{start_x_circle:.4f} Y{start_y_circle:.4f} I{i_offset:.4f} J{j_offset:.4f} ; Full CIRCLE DXF ID: {dxf_original_id}")
-                dxf_segment_id_map[gcode_line_idx] = dxf_original_id
+                gcode_lines.append(f"N{gcode_line_idx*10} G03 X{start_x_circle:.4f}
+                                    Y{start_y_circle:.4f} I{i_offset:.4f} J{j_offset:.4f} ; Full CIRCLE DXF ID: {dxf_original_id}")
+                dxf_segment_id_map[gcode_line_idx] = f"C{dxf_original_id}"
                 gcode_line_idx += 1
-                current_x, current_y = start_x_circle, start_y_circle # End point is the same as start point
+                current_x, current_y = start_x_circle, start_y_circle
 
-        # End of program
         gcode_lines.append(f"N{gcode_line_idx*10} M02 ; Program End")
         dxf_segment_id_map[gcode_line_idx] = "PROGRAM_END"
         gcode_line_idx += 1
@@ -312,42 +319,38 @@ class DxfProcessor:
         
     def generate_auto_path(self, current_dxf_entities, start_entity_data=None):
         """
-        Generates an ordered path automatically based on connectivity, handling multiple disconnected profiles
-        and separate isolated circles.
-        Returns the list of ordered segment data (lines and arcs) and a separate list of isolated circle data.
+        Retourne une liste de listes : chaque sous-liste est une trajectoire (boucle ou chemin ouvert).
         """
         if not current_dxf_entities:
-            return [], [] # <-- Modified to return two lists
+            return [], []
 
         remaining_entities_processing = {}
-        isolated_circles = [] # <-- Added for isolated circles
+        isolated_circles = []
 
-        # Separate circles from lines/arcs and make deep copies
         for original_id, data in current_dxf_entities.items():
             if data['type'] == 'CIRCLE':
                 isolated_circles.append(copy.deepcopy(data))
             else:
                 remaining_entities_processing[original_id] = copy.deepcopy(data)
 
-        ordered_segments_local = []
+        ordered_trajectories = []  # <-- PATCH: liste de listes
         started_with_user_specified_entity = False
 
         while remaining_entities_processing:
             current_path_segments = []
             first_segment_data_for_island = None
-            
+
+            # Si l'utilisateur a spécifié un point de départ, ne l'utiliser que pour la première trajectoire
             if start_entity_data and not started_with_user_specified_entity:
-                target_original_id = start_entity_data['id'] 
+                target_original_id = start_entity_data['id']
                 if target_original_id in remaining_entities_processing:
                     first_segment_data_for_island = remaining_entities_processing.pop(target_original_id)
                     if start_entity_data['reversed'] != first_segment_data_for_island['reversed']:
                         self.reverse_segment_direction(first_segment_data_for_island)
-                    started_with_user_specified_entity = True 
-                else:
-                    pass 
-            
+                    started_with_user_specified_entity = True
+
             if not first_segment_data_for_island:
-                # Find the closest LINE/ARC entity to (0,0) among the remaining ones to start a new island
+                # Prend le segment le plus proche de (0,0) pour démarrer une nouvelle trajectoire
                 initial_segment_id, initial_should_reverse, _ = self._get_best_candidate_info((0.0, 0.0), remaining_entities_processing)
                 if initial_segment_id is not None:
                     first_segment_data_for_island = remaining_entities_processing.pop(initial_segment_id)
@@ -362,20 +365,30 @@ class DxfProcessor:
 
                 while True:
                     next_match_id, next_should_reverse, connection_dist = self._get_best_candidate_info(current_active_point, remaining_entities_processing)
-                    
+                    # PATCH : on considère qu'une boucle est fermée si le point d'arrivée du segment courant
+                    # est très proche du point de départ du premier segment de la trajectoire courante
                     if next_match_id is not None and connection_dist <= self.connection_tolerance:
                         next_segment_data = remaining_entities_processing.pop(next_match_id)
                         if next_should_reverse:
                             self.reverse_segment_direction(next_segment_data)
-                        current_path_segments.append(next_segment_data)
-                        
-                        current_active_point[0] = next_segment_data['coords']['end_point'][0]
-                        current_active_point[1] = next_segment_data['coords']['end_point'][1]
+                        # Vérifie si on boucle sur le premier point
+                        if (math.hypot(
+                                next_segment_data['coords']['end_point'][0] - current_path_segments[0]['coords']['start_point'][0],
+                                next_segment_data['coords']['end_point'][1] - current_path_segments[0]['coords']['start_point'][1]
+                            ) <= self.connection_tolerance
+                        ):
+                            current_path_segments.append(next_segment_data)
+                            # Trajectoire fermée, on arrête ici
+                            break
+                        else:
+                            current_path_segments.append(next_segment_data)
+                            current_active_point[0] = next_segment_data['coords']['end_point'][0]
+                            current_active_point[1] = next_segment_data['coords']['end_point'][1]
                     else:
                         break
-                
-                ordered_segments_local.extend(current_path_segments)
-            else:
-                break # Should not be reached if remaining_entities_processing is not empty
 
-        return ordered_segments_local, isolated_circles # <-- Modified to return two lists
+                ordered_trajectories.append(current_path_segments)
+            else:
+                break
+
+        return ordered_trajectories, isolated_circles
