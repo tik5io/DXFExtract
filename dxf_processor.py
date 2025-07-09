@@ -172,7 +172,6 @@ class DxfProcessor:
         logging.info("Génération du G-code terminée.")
         return "\n".join(gcode_lines), dxf_id_map 
 
-    # --- Méthodes utilitaires internes ---
     
     def _calculate_distance(self, p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
         return math.hypot(p1[0] - p2[0], p1[1] - p2[1]) 
