@@ -2,598 +2,554 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import logging
 import os
-
-# Import your DxfProcessor and GcodeVisualizer classes
+# Assurez-vous que ces modules sont disponibles et correctement implémentés
 from dxf_processor import DxfProcessor
 from gcode_visualizer import GcodeVisualizer
+from typing import List, Dict, Tuple, Set, Any
 
-# Configure logging for the application
-logging.basicConfig(level=logging.INFO, format='[GCODE_VIS_APP] %(message)s')
+# Configuration du logging pour l'application principale
+logging.basicConfig(level=logging.debug, format='[GCODE_VIS_APP] %(message)s')
 
 class AppGUI:
     def __init__(self, master):
         self.master = master
         master.title("G-code Visualizer")
-        master.geometry("1000x800")
+        master.geometry("1200x800")
 
+        # --- Modules de traitement ---
         self.dxf_processor = DxfProcessor()
-        self.current_dxf_entities = {}
+
+        # --- État de l'application ---
         self.gcode_string = ""
-        self.dxf_id_map = {}
+        self.dxf_id_map: Dict[int, str] = {} # Map: line_idx -> original_dxf_id (from G-code generation)
+        self.ordered_trajectories: List[List[Dict]] = [] # Liste des listes de segments ordonnés
+        self.isolated_circles: List[Dict] = []
 
-        self.ordered_trajectories = []   # PATCH: liste de listes de segments (une par boucle/chemin)
-        self.isolated_circles = []
+        # --- NOUVELLE ARCHITECTURE : État de la sélection centralisé ---
+        self.selected_dxf_ids: Set[str] = set() # Utiliser un set pour des recherches rapides et éviter les doublons
+        self.dxf_id_to_line_map: Dict[str, List[int]] = {} # Map: original_id -> [line_idx, ...]
+        # Map: original_dxf_id_segment -> parent_trajectory_tree_id (e.g., 'traj_0', 'isolated_circles_parent')
+        self.dxf_id_to_traj_map: Dict[str, str] = {}
 
-        self.block_colors = {
-            "ORDERED_TRAJECTORY": "blue",
-            "ISOLATED_CIRCLES": "red",
-            "HIGHLIGHT": "orange"
-        }
+        self._is_programmatic_update = False # Flag pour éviter les boucles de mise à jour
 
         self.trajectory_colors = [
             "#FF6666", "#66CC66", "#6699FF", "#FFCC00", "#00CCCC", "#CC66FF", "#FF9966", "#66FFCC"
         ]
 
-        self.create_widgets()
-        self.gcode_text.tag_configure("highlight_gcode", background="#E0E0E0", foreground="blue")
+        self._setup_gui()
 
-    def create_widgets(self):
-        # Top frame for controls
-        top_frame = ttk.Frame(self.master, padding="10")
-        top_frame.pack(side=tk.TOP, fill=tk.X)
+    def regenerate_gcode_from_current_trajectories(self):
+        """Utilise les trajectoires déjà modifiées sans les régénérer automatiquement."""
+        all_ordered_segments = [seg for traj in self.ordered_trajectories for seg in traj]
+        self.gcode_string, self.dxf_id_map = self.dxf_processor.generate_gcode(
+            all_ordered_segments,
+            self.isolated_circles,
+            (0.0, 0.0)
+        )
 
-        self.load_button = ttk.Button(top_frame, text="Load DXF", command=self.load_dxf_file)
-        self.load_button.pack(side=tk.LEFT, padx=5)
+        # Reconstruire la map ligne->id
+        self.dxf_id_to_line_map = {}
+        for line_idx, dxf_id_str in self.dxf_id_map.items():
+            handle = None
+            if '_' in dxf_id_str:
+                handle = dxf_id_str.split('_')[-1]
+            elif dxf_id_str.startswith(('L', 'A', 'C')) and len(dxf_id_str) > 1:
+                handle = dxf_id_str[1:]
+            if handle and handle not in ["HEADER", "INITIAL_POS", "FOOTER"]:
+                self.dxf_id_to_line_map.setdefault(handle, []).append(line_idx)
 
-        self.reverse_button = ttk.Button(top_frame, text="Inverser l'élément", command=self.reverse_selected_element)
-        self.reverse_button.pack(side=tk.LEFT, padx=5)
-        # Main content area - horizontally divided
-        main_pane = ttk.PanedWindow(self.master, orient=tk.HORIZONTAL)
-        main_pane.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.selected_dxf_ids.clear()
+        self.update_gcode_text()
+        self.populate_treeview()
+        self.update_gcode_visualizer()
 
-        # Left frame for G-code display
-        left_frame = ttk.Frame(main_pane, relief=tk.SUNKEN, borderwidth=2)
-        main_pane.add(left_frame, weight=1) # Give it weight so it expands
+    def move_trajectory_up(self):
+        selected = self.gcode_tree.selection()
+        if not selected:
+            return
+        item_id = selected[0]
+        if item_id.startswith("traj_"):
+            idx = int(item_id.split("_")[1])
+            if idx > 0:
+                self.ordered_trajectories[idx - 1], self.ordered_trajectories[idx] = self.ordered_trajectories[idx], self.ordered_trajectories[idx - 1]
+                self.regenerate_gcode_from_current_trajectories()
+        elif item_id in [circle['original_id'] for circle in self.isolated_circles]:
+            idx = next((i for i, c in enumerate(self.isolated_circles) if c['original_id'] == item_id), None)
+            if idx is not None and idx > 0:
+                self.isolated_circles[idx - 1], self.isolated_circles[idx] = self.isolated_circles[idx], self.isolated_circles[idx - 1]
+                self.regenerate_gcode_from_current_trajectories()
+    def move_trajectory_down(self):
+        selected = self.gcode_tree.selection()
+        if not selected:
+            return
+        item_id = selected[0]
+        if item_id.startswith("traj_"):
+            idx = int(item_id.split("_")[1])
+            if idx < len(self.ordered_trajectories) - 1:
+                self.ordered_trajectories[idx + 1], self.ordered_trajectories[idx] = self.ordered_trajectories[idx], self.ordered_trajectories[idx + 1]
+                self.regenerate_gcode_from_current_trajectories()
+        elif item_id in [circle['original_id'] for circle in self.isolated_circles]:
+            idx = next((i for i, c in enumerate(self.isolated_circles) if c['original_id'] == item_id), None)
+            if idx is not None and idx < len(self.isolated_circles) - 1:
+                self.isolated_circles[idx + 1], self.isolated_circles[idx] = self.isolated_circles[idx], self.isolated_circles[idx + 1]
+                self.regenerate_gcode_from_current_trajectories()
+    def delete_selected_trajectory(self):
+        selected = self.gcode_tree.selection()
+        if not selected:
+            return
+        item_id = selected[0]
 
-        self.gcode_text_label = ttk.Label(left_frame, text="Generated G-code:")
-        self.gcode_text_label.pack(side=tk.TOP, padx=5, pady=5, anchor=tk.W)
+        if item_id.startswith("traj_"):
+            idx = int(item_id.split("_")[1])
+            del self.ordered_trajectories[idx]
+            self.regenerate_gcode_from_current_trajectories()
 
-        self.gcode_text = tk.Text(left_frame, wrap=tk.NONE, height=20, width=50) # Use tk.Text for multi-line
-        self.gcode_text.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        elif item_id == "isolated_circles_parent":
+            # Supprime tous les cercles
+            self.isolated_circles.clear()
+            self.regenerate_gcode_from_current_trajectories()
 
-        # Add scrollbars to G-code text
-        gcode_yscroll = ttk.Scrollbar(self.gcode_text, orient=tk.VERTICAL, command=self.gcode_text.yview)
-        gcode_yscroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.gcode_text['yscrollcommand'] = gcode_yscroll.set
+        elif item_id in [circle['original_id'] for circle in self.isolated_circles]:
+            # Supprime un cercle isolé en particulier
+            self.isolated_circles = [c for c in self.isolated_circles if c['original_id'] != item_id]
+            self.regenerate_gcode_from_current_trajectories()
 
-        gcode_xscroll = ttk.Scrollbar(self.gcode_text, orient=tk.HORIZONTAL, command=self.gcode_text.xview)
-        gcode_xscroll.pack(side=tk.BOTTOM, fill=tk.X)
-        self.gcode_text['xscrollcommand'] = gcode_xscroll.set
+    def reverse_selected_trajectory(self):
+        selected = self.gcode_tree.selection()
+        if not selected:
+            return
+        item_id = selected[0]
+        if item_id.startswith("traj_"):
+            idx = int(item_id.split("_")[1])
+            traj = self.ordered_trajectories[idx]
+            for segment in traj:
+                self.dxf_processor._reverse_segment(segment)
+            traj.reverse()
+            self.regenerate_gcode_from_current_trajectories()
+
+    def mark_first_in_trajectory(self):
+        selected = self.gcode_tree.selection()
+        if not selected:
+            return
+        item_id = selected[0]
+        if not self.gcode_tree.tag_has("dxf_entity", item_id):
+            return
+
+        for i, traj in enumerate(self.ordered_trajectories):
+            for j, seg in enumerate(traj):
+                if seg['original_id'] == item_id:
+                    new_traj = traj[j:] + traj[:j]
+                    start_seg = new_traj[0]
+                    reordered = [start_seg]
+                    remaining = new_traj[1:]
+                    active_pt = start_seg['coords']['end_point']
+
+                    while remaining:
+                        found = False
+                        for k, seg in enumerate(remaining):
+                            d = self.dxf_processor._calculate_distance(active_pt, seg['coords']['start_point'])
+                            dr = self.dxf_processor._calculate_distance(active_pt, seg['coords']['end_point'])
+                            if d <= self.dxf_processor.connection_tolerance:
+                                reordered.append(seg)
+                                active_pt = seg['coords']['end_point']
+                                remaining.pop(k)
+                                found = True
+                                break
+                            elif dr <= self.dxf_processor.connection_tolerance:
+                                self.dxf_processor._reverse_segment(seg)
+                                reordered.append(seg)
+                                active_pt = seg['coords']['end_point']
+                                remaining.pop(k)
+                                found = True
+                                break
+                        if not found:
+                            break
+                    self.ordered_trajectories[i] = reordered
+                    self.regenerate_gcode_from_current_trajectories()
+                    return
+
+    def _setup_gui(self):
+        """Construit l'interface graphique."""
+        self.main_frame = ttk.Frame(self.master, padding="10")
+        self.main_frame.pack(fill="both", expand=True)
+
+        # --- Panneau supérieur avec les boutons ---
+        top_frame = ttk.Frame(self.main_frame)
+        top_frame.pack(fill="x", pady=5)
+        ttk.Button(top_frame, text="Load DXF", command=self.load_dxf_file).pack(side="left", padx=5)
+        ttk.Button(top_frame, text="Regenerate G-code", command=self.regenerate_gcode_and_update_gui).pack(side="left", padx=5)
+        ttk.Button(top_frame, text="Save G-code", command=self.save_gcode_file).pack(side="left", padx=5)
+
+        # --- Barre d'outils de réorganisation ---
+        toolbar_frame = ttk.Frame(self.main_frame)
+        toolbar_frame.pack(fill="x", pady=2)
+
+        ttk.Button(toolbar_frame, text="Monter", command=self.move_trajectory_up).pack(side="left", padx=2)
+        ttk.Button(toolbar_frame, text="Descendre", command=self.move_trajectory_down).pack(side="left", padx=2)
+        ttk.Button(toolbar_frame, text="Supprimer", command=self.delete_selected_trajectory).pack(side="left", padx=2)
+        ttk.Button(toolbar_frame, text="Inverser", command=self.reverse_selected_trajectory).pack(side="left", padx=2)
+        ttk.Button(toolbar_frame, text="Marquer comme 1er élément", command=self.mark_first_in_trajectory).pack(side="left", padx=2)
+
+        # --- Panneau de contenu principal (Visualiseur, Arbre, Texte G-code) ---
+        content_frame = ttk.Frame(self.main_frame)
+        content_frame.pack(fill="both", expand=True, pady=5)
+        content_frame.grid_rowconfigure(0, weight=3)
+        content_frame.grid_rowconfigure(1, weight=1)
+        content_frame.grid_columnconfigure(0, weight=3)
+        content_frame.grid_columnconfigure(1, weight=1)
+
+        # --- G-code Visualizer (colonne 0, ligne 0) ---
+        vis_frame = ttk.LabelFrame(content_frame, text="Visualiseur G-code", padding="5")
+        vis_frame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+        self.gcode_visualizer = GcodeVisualizer(vis_frame)
+        self.gcode_visualizer.pack(fill="both", expand=True)
         
-        # Bind an event for G-code text selection
-        # Using <ButtonRelease-1> is more stable for "selection complete" than <<Selection>>
+
+        # --- DXF Elements Treeview (colonne 1, ligne 0) ---
+        tree_frame = ttk.LabelFrame(content_frame, text="Éléments DXF", padding="5")
+        tree_frame.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
+        self.gcode_tree = ttk.Treeview(tree_frame, show="tree")
+        tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.gcode_tree.yview)
+        self.gcode_tree.configure(yscrollcommand=tree_scroll.set)
+        tree_scroll.pack(side="right", fill="y")
+        self.gcode_tree.pack(side="left", fill="both", expand=True)
+        # Lié à <<TreeviewSelect>> pour gérer la sélection de l'utilisateur
+        self.gcode_tree.bind("<<TreeviewSelect>>", self.on_tree_select)
+        # --- G-code Text Output (sur les 2 colonnes, ligne 1) ---
+        text_frame = ttk.LabelFrame(content_frame, text="Sortie G-code", padding="5")
+        text_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=5, pady=5)
+        # Utiliser une couleur de fond blanche pour permettre la sélection
+        self.gcode_text = tk.Text(text_frame, wrap="none", bg="white", undo=True, state="normal")
+        v_scroll = ttk.Scrollbar(text_frame, orient="vertical", command=self.gcode_text.yview)
+        h_scroll = ttk.Scrollbar(text_frame, orient="horizontal", command=self.gcode_text.xview)
+        self.gcode_text.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
+        v_scroll.pack(side="right", fill="y")
+        h_scroll.pack(side="bottom", fill="x")
+        self.gcode_text.pack(side="left", fill="both", expand=True)
+        # Utiliser ButtonRelease-1 est plus fiable pour détecter un clic utilisateur
         self.gcode_text.bind("<ButtonRelease-1>", self.on_gcode_text_select)
-        self.gcode_text.bind("<KeyRelease>", self.on_gcode_text_select) # For keyboard navigation
 
-
-        # Right frame for Treeview and Matplotlib visualizer
-        right_frame = ttk.Frame(main_pane, relief=tk.SUNKEN, borderwidth=2)
-        main_pane.add(right_frame, weight=1) # Give it weight
-
-        # Nested PanedWindow for Treeview (top-right) and Visualizer (bottom-right)
-        right_pane_vertical = ttk.PanedWindow(right_frame, orient=tk.VERTICAL)
-        right_pane_vertical.pack(fill=tk.BOTH, expand=True)
-
-        # Treeview frame
-        tree_frame = ttk.Frame(right_pane_vertical, relief=tk.FLAT)
-        right_pane_vertical.add(tree_frame, weight=1)
-
-        self.tree_label = ttk.Label(tree_frame, text="DXF Entities:")
-        self.tree_label.pack(side=tk.TOP, padx=5, pady=5, anchor=tk.W)
-
-        # Create Treeview
-        self.tree = ttk.Treeview(tree_frame, columns=("DXF ID", "Action"), show="tree headings")
-        self.tree.heading("#0", text="G-code Line #", anchor=tk.W)
-        self.tree.heading("DXF ID", text="DXF ID", anchor=tk.W)
-        self.tree.heading("Action", text="↔️", anchor=tk.CENTER)
-        self.tree.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-        tree_yscroll = ttk.Scrollbar(self.tree, orient=tk.VERTICAL, command=self.tree.yview)
-        tree_yscroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.tree['yscrollcommand'] = tree_yscroll.set
-
-        self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
-        self.tree.bind("<Double-1>", self.on_tree_double_click)
-
-        # Visualizer frame
-        visualizer_frame = ttk.Frame(right_pane_vertical, relief=tk.FLAT)
-        right_pane_vertical.add(visualizer_frame, weight=2) # Give more weight to visualizer
-
-        self.gcode_visualizer = GcodeVisualizer(visualizer_frame) # Pass the frame to the visualizer
-
-        # Drag-and-drop bindings
-        self.tree.bind("<ButtonPress-1>", self.on_tree_drag_start)
-        self.tree.bind("<B1-Motion>", self.on_tree_drag_motion)
-        self.tree.bind("<ButtonRelease-1>", self.on_tree_drag_drop)
-        self.tree.bind("<ButtonRelease-1>", self.on_tree_action_click)
-        self._dragged_item = None
+        # --- Barre de statut ---
+        self.status_label = ttk.Label(self.main_frame, text="Prêt", relief="sunken", anchor="w")
+        self.status_label.pack(side="bottom", fill="x", pady=(5,0))
 
     def load_dxf_file(self):
-        file_path = filedialog.askopenfilename(
-            title="Select DXF File",
-            filetypes=[("DXF Files", "*.dxf")]
-        )
-        if not file_path:
+        """Ouvre un fichier DXF, le traite et met à jour l'IHM."""
+        file_path = filedialog.askopenfilename(filetypes=[("DXF Files", "*.dxf"), ("All Files", "*.*")])
+        if not file_path: return
+
+        self.status_label.config(text=f"Chargement de {os.path.basename(file_path)}...")
+        dxf_entities = self.dxf_processor.extract_dxf_entities(file_path)
+        if dxf_entities:
+            self.regenerate_gcode_and_update_gui(dxf_entities)
+            self.status_label.config(text=f"Fichier {os.path.basename(file_path)} traité.")
+        else:
+            messagebox.showerror("Erreur DXF", "Impossible de lire ou traiter le fichier DXF.")
+            self.status_label.config(text="Échec du chargement DXF.")
+
+    def regenerate_gcode_and_update_gui(self, dxf_entities=None):
+        """Génère le G-code et met à jour tous les composants de l'IHM."""
+        if dxf_entities is None:
+            dxf_entities = self.dxf_processor.current_dxf_entities
+        if not dxf_entities:
+            messagebox.showwarning("Avertissement", "Aucune entité DXF à traiter.")
             return
 
-        logging.info(f"[GCODE_VIS_APP] Loading DXF file: {file_path}")
+        logging.info("Régénération du G-code et mise à jour de l'IHM...")
+        self.ordered_trajectories, self.isolated_circles = self.dxf_processor.generate_auto_path(dxf_entities)
 
-        try:
-            self.current_dxf_entities = self.dxf_processor.extract_dxf_entities(file_path)
-            if self.current_dxf_entities is None:
-                logging.error("[GCODE_VIS_APP] DXF extraction failed.")
-                return
+        all_ordered_segments = [seg for traj in self.ordered_trajectories for seg in traj]
 
-            # PATCH: multi-trajectoires
-            self.ordered_trajectories, self.isolated_circles = self.dxf_processor.generate_auto_path(self.current_dxf_entities)
+        self.gcode_string, self.dxf_id_map = self.dxf_processor.generate_gcode(all_ordered_segments, self.isolated_circles, (0.0, 0.0))
 
-            # Concatène tous les segments pour le G-code
-            all_segments = [seg for traj in self.ordered_trajectories for seg in traj]
-            self.gcode_string, self.dxf_id_map = self.dxf_processor.generate_gcode(
-                all_segments, self.isolated_circles, initial_start_point=(0.0, 0.0)
-            )
+        # Créer la map inversée pour la nouvelle architecture
+        self.dxf_id_to_line_map = {}
+        for line_idx, dxf_id_str in self.dxf_id_map.items():
+            handle = None
+            # Extract the actual DXF handle (e.g., 'A123' -> '123')
+            # This part needs to match how your dxf_processor.py formats the original_id
+            if '_' in dxf_id_str: # For "JUMP_TO_DXF_ABC"
+                handle = dxf_id_str.split('_')[-1]
+            elif dxf_id_str.startswith(('L', 'A', 'C')) and len(dxf_id_str) > 1: # For "LABC", "AXYZ", "C123"
+                handle = dxf_id_str[1:]
+            
+            if handle and handle not in ["HEADER", "INITIAL_POS", "FOOTER"]: # Filter out non-entity IDs
+                if handle not in self.dxf_id_to_line_map:
+                    self.dxf_id_to_line_map[handle] = []
+                self.dxf_id_to_line_map[handle].append(line_idx)
+        
+        # Réinitialiser la sélection
+        self.selected_dxf_ids.clear()
 
-            self.gcode_text.delete(1.0, tk.END)
-            self.gcode_text.insert(tk.END, self.gcode_string)
+        # Mettre à jour les widgets
+        self.update_gcode_text()
+        self.populate_treeview() # Appel modifié pour la nouvelle structure
+        self.update_gcode_visualizer()
+        logging.info("IHM mise à jour.")
 
-            self.clear_treeview()
-            self.populate_treeview()
+    def save_gcode_file(self):
+        if not self.gcode_string:
+            messagebox.showwarning("Sauvegarde impossible", "Aucun G-code à sauvegarder.")
+            return
+        file_path = filedialog.asksaveasfilename(defaultextension=".gcode", filetypes=[("G-code Files", "*.gcode")])
+        if file_path:
+            try:
+                with open(file_path, 'w') as f: f.write(self.gcode_string)
+                self.status_label.config(text=f"G-code sauvegardé : {os.path.basename(file_path)}")
+            except Exception as e:
+                messagebox.showerror("Erreur de sauvegarde", f"Échec de la sauvegarde : {e}")
 
-            self.master.update_idletasks()
-
-            self.gcode_visualizer.update_gcode(self.gcode_string, self.dxf_id_map, self.block_colors)
-
-            self.tree.selection_remove(self.tree.selection())
-            self.gcode_text.tag_remove("highlight_gcode", "1.0", tk.END)
-            self.gcode_visualizer.highlight_gcode_line(None)
-
-            logging.info("[GCODE_VIS_APP] DXF file successfully loaded and processed.")
-
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to load or process DXF: {e}")
-            logging.exception("[GCODE_VIS_APP] Error loading or processing DXF.")
-
-    def clear_treeview(self):
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        logging.info("[GCODE_VIS_APP] Treeview cleared.")
+    def update_gcode_text(self):
+        self.gcode_text.delete("1.0", tk.END)
+        self.gcode_text.insert("1.0", self.gcode_string)
 
     def populate_treeview(self):
-        logging.info("[GCODE_VIS_APP] Populating Treeview...")
+        """
+        Popule le Treeview avec les entités DXF regroupées par trajectoires.
+        Cette version est basée sur la structure DXF (trajectoires et cercles isolés)
+        et non directement sur les lignes de G-code.
+        """
+        self.gcode_tree.delete(*self.gcode_tree.get_children())
+        self.dxf_id_to_traj_map.clear() # Vider la map avant de la remplir
 
-        reverse_dxf_map = {}
-        for line_num, dxf_id in self.dxf_id_map.items():
-            if isinstance(dxf_id, str) and (dxf_id.startswith(('L', 'A', 'C'))):
-                if dxf_id not in reverse_dxf_map:
-                    reverse_dxf_map[dxf_id] = []
-                reverse_dxf_map[dxf_id].append(line_num)
+        # Afficher les trajectoires ordonnées
+        for i, trajectory in enumerate(self.ordered_trajectories):
+            traj_parent_id = f"traj_{i}"
+            # Le texte indique le nombre d'entités dans la trajectoire
+            self.gcode_tree.insert("", "end", traj_parent_id, 
+                                   text=f"Trajectoire {i+1} ({len(trajectory)} entités)", 
+                                   tags=("trajectory_parent",), open=True) 
+            
+            for seg in trajectory:
+                dxf_id = seg['original_id']
+                dxf_type = seg['type'] # e.g., 'LINE', 'ARC'
+                
+                # Utiliser dxf_id directement comme item_id pour la logique de sélection
+                self.gcode_tree.insert(traj_parent_id, "end", dxf_id, 
+                                       text=f"{dxf_type}: {dxf_id}", 
+                                       values=(dxf_id, dxf_type), # Stocker les données pertinentes
+                                       tags=("dxf_entity",)) # Nouveau tag pour les entités DXF individuelles
+                # Mapper original_id à son élément parent du Treeview
+                self.dxf_id_to_traj_map[dxf_id] = traj_parent_id
 
-        # PATCH: Un parent par boucle/chemin
-        parent_ids = []
-        for i, ordered_segments in enumerate(self.ordered_trajectories):
-            parent_iid = f"ORDERED_TRAJECTORY_BLOCK_{i+1}"
+        # Afficher les cercles isolés
+        if self.isolated_circles:
+            isolated_parent_id = "isolated_circles_parent" 
+            self.gcode_tree.insert("", "end", isolated_parent_id, 
+                                   text=f"Cercles isolés ({len(self.isolated_circles)} entités)", 
+                                   tags=("isolated_parent",), open=True) 
+            
+            for circle in self.isolated_circles:
+                dxf_id = circle['original_id']
+                dxf_type = circle['type'] # Devrait être 'CIRCLE'
+                
+                self.gcode_tree.insert(isolated_parent_id, "end", dxf_id, 
+                                       text=f"{dxf_type}: {dxf_id}", 
+                                       values=(dxf_id, dxf_type),
+                                       tags=("dxf_entity",))
+                self.dxf_id_to_traj_map[dxf_id] = isolated_parent_id
+
+    def update_gcode_visualizer(self):
+        # Reconstruction complète avec déplacements G0 visibles
+        visualizer_segments = []
+        current_x, current_y = 0.0, 0.0  # position initiale
+        for i, trajectory in enumerate(self.ordered_trajectories):
             color = self.trajectory_colors[i % len(self.trajectory_colors)]
-            tag = f"traj_color_{i}"
-            self.tree.insert(
-                "", "end", iid=parent_iid,
-                text=f"● Ordered Trajectory {i+1}",
-                values=(f"ORDERED_TRAJECTORY_{i+1}",),
-                tags=(tag,)
-            )
-            self.tree.tag_configure(tag, foreground=color)
-            for seg in ordered_segments:
-                if seg['type'] == 'LINE':
-                    dxf_id_str = f"L{seg['original_id']}"
-                elif seg['type'] == 'ARC':
-                    dxf_id_str = f"A{seg['original_id']}"
-                else:
+            for segment in trajectory:
+                sx, sy = segment['coords']['start_point']
+                if self.dxf_processor._calculate_distance((current_x, current_y), (sx, sy)) > self.dxf_processor.connection_tolerance:
+                    # Ajouter segment G0 fictif
+                    visualizer_segments.append({
+                        'type': 'LINE',
+                        'coords': {'start_point': (current_x, current_y), 'end_point': (sx, sy)},
+                        'color': 'gray',
+                        'original_id': f"JUMP_TO_DXF_{segment['original_id']}"
+                    })
+                visualizer_segments.append({
+                    'type': segment['type'],
+                    'coords': segment['coords'],
+                    'color': color,
+                    'original_id': segment['original_id'],
+                    'direction_reversed': segment.get('direction_reversed', False)
+                })
+                current_x, current_y = segment['coords']['end_point']
+        # Cercles isolés (même logique)
+        for circle in self.isolated_circles:
+            cx, cy = circle['coords']['center']
+            r = circle['coords']['radius']
+            sx, sy = (cx + r, cy)
+            if self.dxf_processor._calculate_distance((current_x, current_y), (sx, sy)) > self.dxf_processor.connection_tolerance:
+                visualizer_segments.append({
+                    'type': 'LINE',
+                    'coords': {'start_point': (current_x, current_y), 'end_point': (sx, sy)},
+                    'color': 'gray',
+                    'original_id': f"JUMP_TO_CIRCLE_{circle['original_id']}"
+                })
+            visualizer_segments.append({
+                'type': 'CIRCLE',
+                'coords': circle['coords'],
+                'color': 'red',
+                'original_id': circle['original_id']
+            })
+            current_x, current_y = sx, sy
+
+        # Mettre à jour le visualiseur avec les segments
+        self.gcode_visualizer.draw_gcode_path(visualizer_segments)
+
+    def _update_gcode_text_selection(self):
+        """Met à jour la sélection de l'éditeur de texte en fonction de self.selected_dxf_ids."""
+        logging.info(f"[GCODE_TEXT_SEL] Début _update_gcode_text_selection. selected_dxf_ids: {self.selected_dxf_ids}") # Nouveau log
+        self.gcode_text.tag_remove(tk.SEL, "1.0", tk.END)
+        self.gcode_text.focus_set()  # <-- Ajoute ceci pour forcer la sélection visible
+        gcode_lines_to_select = []
+        for dxf_id in self.selected_dxf_ids:
+            lines = self.dxf_id_to_line_map.get(dxf_id, [])
+            if not lines:
+                logging.warning(f"[GCODE_TEXT_SEL] Aucun G-code line_idx trouvé pour dxf_id: {dxf_id}. dxf_id_to_line_map: {self.dxf_id_to_line_map.keys()}")
+            gcode_lines_to_select.extend(lines)
+
+        logging.info(f"[GCODE_TEXT_SEL] Lignes G-code à sélectionner (avant tri/dedupl.): {gcode_lines_to_select}") # Nouveau log
+
+        if gcode_lines_to_select:
+            gcode_lines_to_select = sorted(list(set(gcode_lines_to_select)))
+            logging.info(f"[GCODE_TEXT_SEL] Lignes G-code à sélectionner (après tri/dedupl.): {gcode_lines_to_select}") # Nouveau log
+            for line_idx in gcode_lines_to_select:
+                self.gcode_text.tag_add(tk.SEL, f"{line_idx + 1}.0", f"{line_idx + 1}.end")
+                logging.info(f"[GCODE_TEXT_SEL] Sélection ajoutée pour la ligne: {line_idx + 1}") # Nouveau log
+            if gcode_lines_to_select:
+                self.gcode_text.see(f"{gcode_lines_to_select[0] + 1}.0")
+                logging.info(f"[GCODE_TEXT_SEL] Fait défiler jusqu'à la ligne: {gcode_lines_to_select[0] + 1}") # Nouveau log
+        else:
+            logging.info("[GCODE_TEXT_SEL] Aucune ligne G-code à sélectionner.")
+
+    def _refresh_widgets_from_selection(self):
+        """Met à jour tous les widgets (visualiseur, texte, treeview) à partir de la source de vérité : self.selected_dxf_ids."""
+        self._is_programmatic_update = True # Débute une mise à jour programmatique
+        try:
+            # 1. Rafraîchir le visualiseur
+            self.gcode_visualizer.highlight_dxf_entities_by_ids(list(self.selected_dxf_ids))
+
+            # 2. Rafraîchir l'éditeur de texte
+            self._update_gcode_text_selection()
+
+            # 3. Rafraîchir le Treeview
+            current_tree_selection = set(self.gcode_tree.selection())
+            desired_tree_selection = set()
+
+            # Ajouter les éléments DXF individuels à la sélection désirée
+            for dxf_id in self.selected_dxf_ids:
+                if self.gcode_tree.exists(dxf_id): # Vérifier si l'ID DXF existe comme élément de l'arbre
+                    desired_tree_selection.add(dxf_id)
+            
+            # Ajouter les éléments parent de trajectoire/cercles isolés si tous leurs enfants sont sélectionnés
+            # Pour les trajectoires ordonnées:
+            for i, trajectory in enumerate(self.ordered_trajectories):
+                traj_tree_id = f"traj_{i}"
+                if not self.gcode_tree.exists(traj_tree_id):
                     continue
-                original_int_id = int(dxf_id_str[1:])
-                display_text = self.current_dxf_entities.get(original_int_id, {}).get('id_display', f"DXF ID: {dxf_id_str}")
-                entity_item_iid = dxf_id_str
-                self.tree.insert(
-                    parent_iid, "end", iid=entity_item_iid,
-                    text=display_text,
-                    values=(dxf_id_str, "↔️")
-                )
-                for line_num_0_based in sorted(reverse_dxf_map.get(dxf_id_str, [])):
-                    line_num_1_based = line_num_0_based + 1
-                    self.tree.insert(entity_item_iid, "end", text=f"G-code Line {line_num_1_based}", values=(f"LINE_GCODE_{line_num_1_based}",))
 
-        # Isolated circles (inchangé)
-        isolated_circles_parent = self.tree.insert("", "end", iid="ISOLATED_CIRCLES_BLOCK",
-                                                   text="Isolated Circles", values=("ISOLATED_CIRCLES",))
-        for seg in self.isolated_circles:
-            if seg['type'] == 'CIRCLE':
-                dxf_id_str = f"C{seg['original_id']}"
-                original_int_id = int(dxf_id_str[1:])
-                display_text = self.current_dxf_entities.get(original_int_id, {}).get('id_display', f"DXF ID: {dxf_id_str}")
-                entity_item_iid = dxf_id_str
-                self.tree.insert(isolated_circles_parent, "end", iid=entity_item_iid, text=display_text, values=(dxf_id_str,))
-                for line_num_0_based in sorted(reverse_dxf_map.get(dxf_id_str, [])):
-                    line_num_1_based = line_num_0_based + 1
-                    self.tree.insert(entity_item_iid, "end", text=f"G-code Line {line_num_1_based}", values=(f"LINE_GCODE_{line_num_1_based}",))
+                all_children_selected = True
+                if not trajectory: # Gérer les trajectoires vides
+                    all_children_selected = False 
+                else:
+                    for seg in trajectory:
+                        if seg['original_id'] not in self.selected_dxf_ids:
+                            all_children_selected = False
+                            break
+                if all_children_selected and trajectory: # S'assurer qu'il y a des enfants et qu'ils sont tous sélectionnés
+                    desired_tree_selection.add(traj_tree_id)
 
-        logging.info("[GCODE_VIS_APP] Treeview populated successfully.")
+            # Pour les cercles isolés:
+            if self.isolated_circles:
+                circ_tree_id = "isolated_circles_parent"
+                if self.gcode_tree.exists(circ_tree_id):
+                    all_children_selected = True
+                    for circle in self.isolated_circles:
+                        if circle['original_id'] not in self.selected_dxf_ids:
+                            all_children_selected = False
+                            break
+                    if all_children_selected and self.isolated_circles: # S'assurer qu'il y a des enfants et qu'ils sont tous sélectionnés
+                        desired_tree_selection.add(circ_tree_id)
+
+            if desired_tree_selection != current_tree_selection:
+                self.gcode_tree.selection_set(list(desired_tree_selection))
+                if desired_tree_selection:
+                    self.gcode_tree.see(list(desired_tree_selection)[0])
+                
+        finally:
+            self._is_programmatic_update = False
+
 
     def on_tree_select(self, event):
-        selected_item_ids = self.tree.selection() # Get all selected items
+        """Met à jour l'état de la sélection depuis le Treeview et rafraîchit tous les autres widgets."""
+        if self._is_programmatic_update:
+            logging.info("[TREE_SELECT] Ignoré: mise à jour programmatique.") # Nouveau log
+            return # Ignore les sélections déclenchées par le programme
 
-        # Clear previous selections/highlights in other widgets
-        self.gcode_text.tag_remove("highlight_gcode", "1.0", tk.END)
-        self.gcode_visualizer.highlight_gcode_line(None) # Clear visualizer highlight
+        selected_items_in_tree = self.gcode_tree.selection() # Ce sont les items *explicitement* sélectionnés par l'utilisateur
+        logging.info(f"[TREE_SELECT] Éléments Treeview sélectionnés par l'utilisateur: {selected_items_in_tree}") # Nouveau log
 
-        if not selected_item_ids:
-            logging.info("[GCODE_VIS_APP] Treeview selection cleared. Clearing all highlights.")
-            return
+        new_selected_dxf_ids = set()
 
-        selected_item_id = selected_item_ids[0]
-
-        # PATCH: surlignage par boucle
-        if selected_item_id.startswith("ORDERED_TRAJECTORY_BLOCK_"):
-            # Numéro de la boucle
-            idx = int(selected_item_id.replace("ORDERED_TRAJECTORY_BLOCK_", "")) - 1
-            if 0 <= idx < len(self.ordered_trajectories):
-                # Récupère tous les dxf_id de la boucle
-                dxf_ids = []
-                for seg in self.ordered_trajectories[idx]:
-                    if seg['type'] == 'LINE':
-                        dxf_ids.append(f"L{seg['original_id']}")
-                    elif seg['type'] == 'ARC':
-                        dxf_ids.append(f"A{seg['original_id']}")
-                # Surligne dans matplotlib et dans le gcode
-                self.gcode_visualizer.highlight_gcode_line(dxf_ids)
-                self._highlight_gcode_text_by_dxf_ids(dxf_ids)
-                logging.info(f"[GCODE_VIS_APP] Treeview select event: Selected Block ID: ORDERED_TRAJECTORY_{idx+1}")
-            return
-        elif selected_item_id == "ISOLATED_CIRCLES_BLOCK":
-            self.gcode_visualizer.highlight_gcode_line("ISOLATED_CIRCLES")
-            self._highlight_gcode_text_by_block("ISOLATED_CIRCLES")
-            logging.info(f"[GCODE_VIS_APP] Treeview select event: Selected Block ID: ISOLATED_CIRCLES")
-            return
-        else:
-            # It's an individual DXF entity (L1, A2, C3) or a G-code line (LINE_GCODE_X)
-            item_values = self.tree.item(selected_item_id, 'values')
-            if item_values:
-                selected_dxf_or_gcode_id = item_values[0]
-                if selected_dxf_or_gcode_id.startswith("LINE_GCODE_"):
-                    # If an individual G-code line is selected, we need its parent's DXF ID for visualizer highlight
-                    parent_iid = self.tree.parent(selected_item_id)
-                    if parent_iid:
-                        parent_values = self.tree.item(parent_iid, 'values')
-                        if parent_values:
-                            selected_dxf_entity_id_for_highlight = parent_values[0]
-                            logging.info(f"[GCODE_VIS_APP] Treeview select event: Selected G-code line {selected_dxf_or_gcode_id}, highlighting parent DXF ID: {selected_dxf_entity_id_for_highlight}")
-                            self.gcode_visualizer.highlight_gcode_line(selected_dxf_entity_id_for_highlight)
-                            # Highlight this specific G-code line in the text widget
-                            line_num_1_based = int(selected_dxf_or_gcode_id.replace("LINE_GCODE_", ""))
-                            self._apply_gcode_text_highlight([line_num_1_based - 1])
-                            # Optionally, select the parent entity in the treeview as well:
-                            # self.tree.selection_set(parent_iid)
-                            return
-                else:
-                    # It's a direct DXF entity ID (L1, A2, C3)
-                    logging.info(f"[GCODE_VIS_APP] Treeview select event: Selected DXF entity ID: {selected_dxf_or_gcode_id}")
-                    self.gcode_visualizer.highlight_gcode_line(selected_dxf_or_gcode_id)
-                    self._highlight_gcode_text_by_dxf_id(selected_dxf_or_gcode_id)
-                    return
-            else:
-                # If no values, try to get parent (for robustness)
-                parent_iid = self.tree.parent(selected_item_id)
-                if parent_iid:
-                    parent_values = self.tree.item(parent_iid, 'values')
-                    if parent_values:
-                        selected_dxf_entity_id_for_highlight = parent_values[0]
-                        self.gcode_visualizer.highlight_gcode_line(selected_dxf_entity_id_for_highlight)
-                        # Optionally, highlight all G-code lines for this entity
-                        self._highlight_gcode_text_by_dxf_id(selected_dxf_entity_id_for_highlight)
-
-    def on_tree_double_click(self, event):
-        item_id = self.tree.identify_row(event.y)
-        if not item_id:
-            return
-        item_values = self.tree.item(item_id, 'values')
-        if not item_values:
-            return
-        dxf_id = item_values[0]
-        if dxf_id.startswith("L") or dxf_id.startswith("A"):
-            # Trouver l'entité correspondante dans current_dxf_entities
-            original_int_id = int(dxf_id[1:])
-            start_entity_data = self.current_dxf_entities.get(original_int_id)
-            if start_entity_data:
-                # Recalcule la trajectoire à partir de cet élément
-                self.ordered_trajectories, self.isolated_circles = self.dxf_processor.generate_auto_path(self.current_dxf_entities, start_entity_data)
-                all_segments = [seg for traj in self.ordered_trajectories for seg in traj]
-                self.gcode_string, self.dxf_id_map = self.dxf_processor.generate_gcode(all_segments, self.isolated_circles, initial_start_point=(0.0, 0.0))
-                self.gcode_text.delete(1.0, tk.END)
-                self.gcode_text.insert(tk.END, self.gcode_string)
-                self.clear_treeview()
-                self.populate_treeview()
-                self.gcode_visualizer.update_gcode(self.gcode_string, self.dxf_id_map, self.block_colors)
-
-    def reverse_selected_element(self):
-        """Inverse le sens de l'élément sélectionné (ligne ou arc). Si bloc, inverse la trajectoire.
-        Pour les éléments de 'ordered trajectory', force le rerouting pour garder la cohérence.
-        Pour les éléments isolés, inverse juste le sens sans rerouting.
-        """
-        selected_item_ids = self.tree.selection()
-        if not selected_item_ids:
-            messagebox.showinfo("Aucune sélection", "Sélectionnez un élément à inverser dans l'arbre.")
-            return
-
-        selected_item_id = selected_item_ids[0]
-        item_values = self.tree.item(selected_item_id, 'values')
-        if not item_values:
-            # Peut-être un bloc parent (ex: ORDERED_TRAJECTORY_BLOCK_1)
-            if selected_item_id.startswith("ORDERED_TRAJECTORY_BLOCK_"):
-                idx = int(selected_item_id.replace("ORDERED_TRAJECTORY_BLOCK_", "")) - 1
-                if 0 <= idx < len(self.ordered_trajectories):
-                    traj = self.ordered_trajectories[idx]
-                    if traj:
-                        # Inverser le premier segment
-                        self.dxf_processor.reverse_segment_direction(traj[0])
-                        # Inverser l'ordre de la trajectoire
-                        traj = list(reversed(traj))
-                        # Re-routing complet pour cohérence
-                        self.ordered_trajectories, self.isolated_circles = self.dxf_processor.generate_auto_path(self.current_dxf_entities, traj[0])                        # Reconcatène tous les segments pour le G-code
-                        all_segments = [seg for t in self.ordered_trajectories for seg in t]
-                        self.gcode_string, self.dxf_id_map = self.dxf_processor.generate_gcode(
-                            all_segments, self.isolated_circles, initial_start_point=(0.0, 0.0)
-                        )
-                        self.gcode_text.delete(1.0, tk.END)
-                        self.gcode_text.insert(tk.END, self.gcode_string)
-                        self.clear_treeview()
-                        self.populate_treeview()
-                        self.gcode_visualizer.update_gcode(self.gcode_string, self.dxf_id_map, self.block_colors)
-                return
-            else:
-                return
-
-        dxf_id = item_values[0]
-        # Si c'est une entité DXF (Lx ou Ax)
-        if dxf_id.startswith("L") or dxf_id.startswith("A"):
-            original_int_id = int(dxf_id[1:])
-            found = False
-            for traj_idx, traj in enumerate(self.ordered_trajectories):
-                for seg in traj:
-                    if seg['original_id'] == original_int_id and seg['type'][0] == dxf_id[0]:
-                        self.dxf_processor.reverse_segment_direction(seg)
-                        # Après inversion, on force le rerouting pour cohérence
-                        self.ordered_trajectories, self.isolated_circles = self.dxf_processor.generate_auto_path(self.current_dxf_entities, seg)
-                        found = True
-                        break
-                if found:
-                    break
-            all_segments = [seg for t in self.ordered_trajectories for seg in t]
-            self.gcode_string, self.dxf_id_map = self.dxf_processor.generate_gcode(
-                all_segments, self.isolated_circles, initial_start_point=(0.0, 0.0)
-            )
-            self.gcode_text.delete(1.0, tk.END)
-            self.gcode_text.insert(tk.END, self.gcode_string)
-            self.clear_treeview()
-            self.populate_treeview()
-            self.gcode_visualizer.update_gcode(self.gcode_string, self.dxf_id_map, self.block_colors)
-        # Si c'est un cercle isolé (C)
-        elif dxf_id.startswith("C"):
-            original_int_id = int(dxf_id[1:])
-            for seg in self.isolated_circles:
-                if seg['original_id'] == original_int_id and seg['type'][0] == dxf_id[0]:
-                    self.dxf_processor.reverse_segment_direction(seg)
-                    break
-            all_segments = [seg for t in self.ordered_trajectories for seg in t]
-            self.gcode_string, self.dxf_id_map = self.dxf_processor.generate_gcode(
-                all_segments, self.isolated_circles, initial_start_point=(0.0, 0.0)
-            )
-            self.gcode_text.delete(1.0, tk.END)
-            self.gcode_text.insert(tk.END, self.gcode_string)
-            self.clear_treeview()
-            self.populate_treeview()
-            self.gcode_visualizer.update_gcode(self.gcode_string, self.dxf_id_map, self.block_colors)
-        # Si c'est un bloc complet
-        elif dxf_id == "ORDERED_TRAJECTORY":
-            if self.ordered_segments:
-                self.dxf_processor.reverse_segment_direction(self.ordered_segments[0])
-                self.ordered_segments = list(reversed(self.ordered_segments))
-                # Re-routing complet pour cohérence
-                self.ordered_segments, self.isolated_circles = self.dxf_processor.generate_auto_path(self.current_dxf_entities, self.ordered_segments[0])
-                self.gcode_string, self.dxf_id_map = self.dxf_processor.generate_gcode(
-                    self.ordered_segments, self.isolated_circles, initial_start_point=(0.0, 0.0)
-                )
-                self.gcode_text.delete(1.0, tk.END)
-                self.gcode_text.insert(tk.END, self.gcode_string)
-                self.clear_treeview()
-                self.populate_treeview()
-                self.gcode_visualizer.update_gcode(self.gcode_string, self.dxf_id_map, self.block_colors)
-
-    def on_tree_drag_start(self, event):
-        item = self.tree.identify_row(event.y)
-        if not item:
-            return
-        values = self.tree.item(item, 'values')
-        # Autoriser le drag sur les entités DXF OU sur les parents de boucle
-        if (values and (values[0].startswith("L") or values[0].startswith("A") or values[0].startswith("C"))) \
-            or (item.startswith("ORDERED_TRAJECTORY_BLOCK_")):
-            self._dragged_item = item
-        else:
-            self._dragged_item = None
-
-    def on_tree_drag_motion(self, event):
-        # Optionnel : feedback visuel (curseur, etc.)
-        pass
-
-    def on_tree_drag_drop(self, event):
-        if not self._dragged_item:
-            return
-        target_item = self.tree.identify_row(event.y)
-        if not target_item or target_item == self._dragged_item:
-            self._dragged_item = None
-            return
-
-        # --- PATCH: Drag & drop de boucles entières ---
-        if self._dragged_item.startswith("ORDERED_TRAJECTORY_BLOCK_") and target_item.startswith("ORDERED_TRAJECTORY_BLOCK_"):
-            src_idx = int(self._dragged_item.replace("ORDERED_TRAJECTORY_BLOCK_", "")) - 1
-            dst_idx = int(target_item.replace("ORDERED_TRAJECTORY_BLOCK_", "")) - 1
-            if src_idx == dst_idx or not (0 <= src_idx < len(self.ordered_trajectories)) or not (0 <= dst_idx < len(self.ordered_trajectories)):
-                self._dragged_item = None
-                return
-            # Réordonne la liste des trajectoires
-            traj = self.ordered_trajectories.pop(src_idx)
-            self.ordered_trajectories.insert(dst_idx, traj)
-            # Met à jour le G-code et l'affichage
-            all_segments = [seg for t in self.ordered_trajectories for seg in t]
-            self.gcode_string, self.dxf_id_map = self.dxf_processor.generate_gcode(
-                all_segments, self.isolated_circles, initial_start_point=(0.0, 0.0)
-            )
-            self.gcode_text.delete(1.0, tk.END)
-            self.gcode_text.insert(tk.END, self.gcode_string)
-            self.clear_treeview()
-            self.populate_treeview()
-            self.gcode_visualizer.update_gcode(self.gcode_string, self.dxf_id_map, self.block_colors)
-            self._dragged_item = None
-            return
-        # --- Fin PATCH ---
-
-        # Vérifie qu'on reste dans le même parent (même boucle)
-        parent_src = self.tree.parent(self._dragged_item)
-        parent_dst = self.tree.parent(target_item)
-        if parent_src != parent_dst or not parent_src:
-            self._dragged_item = None
-            return
-
-        # Récupère la liste de segments de la boucle concernée
-        idx = int(parent_src.replace("ORDERED_TRAJECTORY_BLOCK_", "")) - 1
-        if not (0 <= idx < len(self.ordered_trajectories)):
-            self._dragged_item = None
-            return
-
-        # Récupère l'ordre actuel des entités dans la boucle
-        segs = self.ordered_trajectories[idx]
-        dragged_dxf_id = self.tree.item(self._dragged_item, 'values')[0]
-        target_dxf_id = self.tree.item(target_item, 'values')[0]
-
-        # Trouve les indices dans la liste
-        dragged_idx = next((i for i, seg in enumerate(segs) if f"{seg['type'][0]}{seg['original_id']}" == dragged_dxf_id), None)
-        target_idx = next((i for i, seg in enumerate(segs) if f"{seg['type'][0]}{seg['original_id']}" == target_dxf_id), None)
-        if dragged_idx is None or target_idx is None:
-            self._dragged_item = None
-            return
-
-        # Réordonne la liste
-        seg = segs.pop(dragged_idx)
-        segs.insert(target_idx, seg)
-
-        # Met à jour la trajectoire et le G-code (pas de rerouting, juste l'ordre)
-        all_segments = [seg for t in self.ordered_trajectories for seg in t]
-        self.gcode_string, self.dxf_id_map = self.dxf_processor.generate_gcode(
-            all_segments, self.isolated_circles, initial_start_point=(0.0, 0.0)
-        )
-        self.gcode_text.delete(1.0, tk.END)
-        self.gcode_text.insert(tk.END, self.gcode_string)
-        self.clear_treeview()
-        self.populate_treeview()
-        self.gcode_visualizer.update_gcode(self.gcode_string, self.dxf_id_map, self.block_colors)
-
-        self._dragged_item = None
-
-    def _apply_gcode_text_highlight(self, line_indices):
-        """Surligne les lignes G-code (0-based) passées en paramètre."""
-        self.gcode_text.tag_remove("highlight_gcode", "1.0", tk.END)
-        for idx in line_indices:
-            start = f"{idx+1}.0"
-            end = f"{idx+1}.end"
-            self.gcode_text.tag_add("highlight_gcode", start, end)
-
-    def _highlight_gcode_text_by_dxf_id(self, dxf_id):
-        """Surligne toutes les lignes G-code associées à un DXF ID."""
-        indices = [i for i, v in self.dxf_id_map.items() if v == dxf_id]
-        self._apply_gcode_text_highlight(indices)
-
-    def _highlight_gcode_text_by_dxf_ids(self, dxf_ids):
-        """Surligne toutes les lignes G-code associées à une liste de DXF IDs."""
-        indices = [i for i, v in self.dxf_id_map.items() if v in dxf_ids]
-        self._apply_gcode_text_highlight(indices)
-
-    def _highlight_gcode_text_by_block(self, block_type):
-        """Surligne toutes les lignes G-code d'un bloc (ORDERED_TRAJECTORY ou ISOLATED_CIRCLES)."""
-        if block_type == "ORDERED_TRAJECTORY":
-            indices = [i for i, v in self.dxf_id_map.items() if isinstance(v, str) and (v.startswith("L") or v.startswith("A"))]
-        elif block_type == "ISOLATED_CIRCLES":
-            indices = [i for i, v in self.dxf_id_map.items() if isinstance(v, str) and v.startswith("C")]
-        else:
-            indices = []
-        self._apply_gcode_text_highlight(indices)
-
-    def _select_treeview_item_by_dxf_id(self, dxf_id):
-        """Sélectionne l'item Treeview correspondant à un DXF ID."""
-        self.tree.selection_remove(self.tree.selection())
-        if self.tree.exists(dxf_id):
-            self.tree.selection_set(dxf_id)
-            self.tree.see(dxf_id)
-
-    def _select_treeview_item_by_gcode_line(self, line_idx):
-        """Sélectionne l'item Treeview correspondant à une ligne G-code (0-based)."""
-        dxf_id = self.dxf_id_map.get(line_idx)
-        if not dxf_id:
-            return
-        # Cherche l'item enfant (ligne G-code) dans le Treeview
-        for parent in self.tree.get_children():
-            for entity in self.tree.get_children(parent):
-                for child in self.tree.get_children(entity):
-                    values = self.tree.item(child, 'values')
-                    if values and values[0] == f"LINE_GCODE_{line_idx+1}":
-                        self.tree.selection_remove(self.tree.selection())
-                        self.tree.selection_set(child)
-                        self.tree.see(child)
-                        return
-        # Sinon, sélectionne l'entité DXF
-        self._select_treeview_item_by_dxf_id(dxf_id)
+        for item_id in selected_items_in_tree:
+            if self.gcode_tree.tag_has("trajectory_parent", item_id) or self.gcode_tree.tag_has("isolated_parent", item_id):
+                children_items = self.gcode_tree.get_children(item_id)
+                logging.info(f"[TREE_SELECT] Parent sélectionné ({item_id}), ajout des enfants: {children_items}") # Nouveau log
+                for child_id in children_items:
+                    new_selected_dxf_ids.add(child_id)
+            elif self.gcode_tree.tag_has("dxf_entity", item_id):
+                new_selected_dxf_ids.add(item_id)
+                logging.info(f"[TREE_SELECT] Entité DXF sélectionnée: {item_id}") # Nouveau log
+        
+        logging.info(f"[TREE_SELECT] new_selected_dxf_ids avant mise à jour: {new_selected_dxf_ids}. Précédent selected_dxf_ids: {self.selected_dxf_ids}") # Nouveau log
+        # Mettre à jour l'état centralisé de la sélection
+        self.selected_dxf_ids = new_selected_dxf_ids
+        logging.info(f"[TREE_SELECT] selected_dxf_ids après mise à jour: {self.selected_dxf_ids}") # Nouveau log
+        
+        # IMPORTANT: Rafraîchir TOUS les widgets basés sur la nouvelle sélection, y compris le Treeview.
+        self._refresh_widgets_from_selection()
+        logging.info("[TREE_SELECT] Appel de _refresh_widgets_from_selection.") # Nouveau log
 
     def on_gcode_text_select(self, event):
-        """Callback lors de la sélection dans le widget G-code."""
+        """Met à jour l'état de la sélection depuis l'éditeur de texte et rafraîchit tout."""
+        if self._is_programmatic_update:
+            return
+
+        new_selected_dxf_ids = set()
+        
+        # Obtenir les indices des lignes sélectionnées par l'utilisateur
         try:
-            index = self.gcode_text.index(tk.INSERT)
-            line_idx = int(index.split('.')[0]) - 1  # 0-based
-            dxf_id = self.dxf_id_map.get(line_idx)
-            if dxf_id and isinstance(dxf_id, str) and (dxf_id.startswith("L") or dxf_id.startswith("A") or dxf_id.startswith("C")):
-                self.gcode_visualizer.highlight_gcode_line(dxf_id)
-                self._apply_gcode_text_highlight([line_idx])
-                self._select_treeview_item_by_dxf_id(dxf_id)
-        except Exception:
+            start_index = self.gcode_text.index(tk.SEL_FIRST)
+            end_index = self.gcode_text.index(tk.SEL_LAST)
+            
+            start_line_idx = int(start_index.split('.')[0]) - 1
+            end_line_idx = int(end_index.split('.')[0]) - 1
+            
+            for line_idx in range(start_line_idx, end_line_idx + 1):
+                if 0 <= line_idx < len(self.dxf_id_map):
+                    dxf_id_str_with_prefix = self.dxf_id_map.get(line_idx)
+                    handle = None
+                    # Extraire le handle DXF réel
+                    if dxf_id_str_with_prefix:
+                        if '_' in dxf_id_str_with_prefix: # e.g. JUMP_TO_DXF_ABC
+                            handle = dxf_id_str_with_prefix.split('_')[-1]
+                        elif dxf_id_str_with_prefix.startswith(('L', 'A', 'C')) and len(dxf_id_str_with_prefix) > 1: # e.g. LABCD
+                            handle = dxf_id_str_with_prefix[1:]
+                    if handle and handle not in ["HEADER", "INITIAL_POS", "FOOTER"]:
+                        new_selected_dxf_ids.add(handle)
+        except tk.TclError:
+            # Aucune sélection textuelle active
             pass
 
-    def on_tree_action_click(self, event):
-        # Ignore si on vient de faire un drag and drop
-        if getattr(self, "_dragged_item", None) is not None:
-            return
-        region = self.tree.identify("region", event.x, event.y)
-        if region != "cell":
-            return
-        col = self.tree.identify_column(event.x)
-        if col != "#3":  # "Action" est la 3e colonne (indexée à partir de 1)
-            return
-        row_id = self.tree.identify_row(event.y)
-        if not row_id:
-            return
-        values = self.tree.item(row_id, 'values')
-        if not values or not (values[0].startswith("L") or values[0].startswith("A") or values[0].startswith("C")):
-            return
-        # Inverse l'élément sélectionné
-        self.tree.selection_set(row_id)
-        self.reverse_selected_element()
+        # Mettre à jour l'état centralisé de la sélection
+        self.selected_dxf_ids = new_selected_dxf_ids
+        
+        # Rafraîchir tous les autres widgets (y compris le Treeview)
+        self._refresh_widgets_from_selection()
+
 
 if __name__ == "__main__":
     root = tk.Tk()
     app = AppGUI(root)
     root.mainloop()
-
-    logging.info("[GCODE_VIS_APP] Application started.")
