@@ -1,366 +1,296 @@
-#gcode_visualizer.py
-"""
-This module provides a class for visualizing ISO G-code paths using Matplotlib. 
-It includes methods for parsing G-code, plotting the paths, and highlighting specific elements.
-It is designed to be used in a Jupyter notebook or any Python environment with Matplotlib installed
-and configured.
-"""
-
-
+import tkinter as tk
+from tkinter import Canvas
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt
-import re
-import math
-import sys
+import matplotlib.patches as patches
+from matplotlib.lines import Line2D
+import logging
+import math # Import math module for fmod
+from typing import List, Dict, Tuple, Any
+from matplotlib.colors import to_rgba 
 
-class GcodeVisualizer:
-    """
-    Handles the visualization of ISO G-code paths using Matplotlib.
-    """
-    def __init__(self, ax):
-        self.ax = ax
-        # Remove title, xlabel, ylabel
-        # self.ax.set_title("Visualisation du Trajet CNC (G-code ISO)", fontsize=14)
-        # self.ax.set_xlabel("X Coordonnée")
-        # self.ax.set_ylabel("Y Coordonnée")
-        self.ax.grid(True)
-        self.ax.set_aspect('equal', adjustable='box')
-        # Remove axis ticks and labels
-        self.ax.set_xticks([])
-        self.ax.set_yticks([])
-        self.ax.set_xticklabels([])
-        self.ax.set_yticklabels([])
+logging.basicConfig(level=logging.INFO, format='[GCODE_VIS] %(message)s')
 
-        self._legend_labels = set()
-        self.connection_tolerance = 1e-4 # Used for G00 jumps and now for arc start/end precision
+class GcodeVisualizer(tk.Frame):
+    def __init__(self, master):
+        super().__init__(master)
+        self.figure, self.ax = plt.subplots(figsize=(8, 6))
+        self.canvas = FigureCanvasTkAgg(self.figure, master=self)
+        self.canvas_widget = self.canvas.get_tk_widget()
+        self.canvas_widget.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        self.plotted_elements = [] # Stores all plotted artists for reset/highlight
-        self.gcode_line_map = {} # Maps G-code line index to plotted_elements index
+        self._configure_plot()
 
-        self.current_highlighted_elements = [] # Stores currently highlighted artists
-        self._original_colors = {}
-        self._original_linewidths = {}
-        self._original_markersizes = {}
+        self.path_artists: Dict[str, List[Any]] = {} # Map: original_id -> list of matplotlib artists (Line2D or patches)
+        # Store original colors for highlighting
+        self.original_artist_colors: Dict[Any, Dict[str, Any]] = {} # artist -> {'facecolor': ..., 'edgecolor': ..., 'linecolor': ...}
 
-    def reset_plot(self):
-        """Clears the current plot and resets internal states."""
-        self.ax.clear()
-        # Remove title, xlabel, ylabel
-        # self.ax.set_title("Visualisation du Trajet CNC (G-code ISO)", fontsize=14)
-        # self.ax.set_xlabel("X Coordonnée")
-        # self.ax.set_ylabel("Y Coordonnée")
-        self.ax.grid(True)
-        self.ax.set_aspect('equal', adjustable='box')
-        # Remove axis ticks and labels
-        self.ax.set_xticks([])
-        self.ax.set_yticks([])
-        self.ax.set_xticklabels([])
-        self.ax.set_yticklabels([])
-
-        self._legend_labels = set()
-        self.plotted_elements = []
-        self.gcode_line_map = {}
-        self.current_highlighted_elements = []
-        self._original_colors = {}
-        self._original_linewidths = {}
-        self._original_markersizes = {}
-        self.ax.figure.canvas.draw_idle()
-
-    def _add_plot_label(self, label):
-        """Helper to add unique labels to the legend."""
-        # We're removing the legend, so this function is no longer needed to manage legend labels.
-        # However, it's good practice to keep the original structure if it's called elsewhere
-        # and just make it return None if the label isn't actually used for plotting a legend.
-        return None # No labels for legend
-
-    def _parse_gcode_line(self, line):
-        """Parses a single G-code line into its components."""
-        parsed_data = {
-            'command': None, 'X': None, 'Y': None, 'I': None, 'J': None
-        }
-        line_clean = re.sub(r'N\d+\s*', '', line).split(';')[0].strip()
-        if not line_clean: return None
-        parts = line_clean.split()
-        if not parts: return None
-        parsed_data['command'] = parts[0]
-        for part in parts[1:]:
-            if part.startswith('X'): parsed_data['X'] = float(part[1:])
-            elif part.startswith('Y'): parsed_data['Y'] = float(part[1:])
-            elif part.startswith('I'): parsed_data['I'] = float(part[1:])
-            elif part.startswith('J'): parsed_data['J'] = float(part[1:])
-        return parsed_data
-
-    def visualize(self, gcode_string, dxf_segment_id_map=None):
-        """
-        Visualizes the given G-code string on the Matplotlib axes.
-        Args:
-            gcode_string (str): The G-code content as a string.
-            dxf_segment_id_map (dict, optional): A dictionary mapping G-code line index
-                                                 to the original DXF segment ID.
-                                                 Used for displaying IDs on the plot.
-                                                 Defaults to None.
-        """
-        if dxf_segment_id_map is None:
-            dxf_segment_id_map = {}
-
-        self.reset_plot()
-
-        current_x, current_y = 0.0, 0.0
-        start_point_marked = False
-        end_point_of_path = (None, None)
-
-        gcode_lines = gcode_string.strip().split('\n')
+        # Connect event for mouse scroll (zoom)
+        self.canvas.mpl_connect("scroll_event", self._on_scroll)
+        # Connect events for pan
+        self.canvas.mpl_connect('button_press_event', self._on_button_press)
+        self.canvas.mpl_connect('button_release_event', self._on_button_release)
+        self.canvas.mpl_connect('motion_notify_event', self._on_motion)
+        self.canvas.mpl_connect("scroll_event", self._on_scroll)
         
-        self.plotted_elements = []
-        self.gcode_line_map = {}
+        self._pan_start = None
+        self._xlim_at_press = None
+        self._ylim_at_press = None
 
-        for i, line_str in enumerate(gcode_lines):
-            parsed = self._parse_gcode_line(line_str)
-            
-            # Get the original DXF segment ID for this G-code line, if available
-            original_dxf_id = dxf_segment_id_map.get(i, 'N/A')
-            dxf_id_label = f' (DXF ID: {original_dxf_id})' if original_dxf_id != 'N/A' else ''
+    def _configure_plot(self):
+        """Configure l'aspect du graphique pour un affichage épuré avec axes XY minimalistes."""
+        self.ax.set_aspect('equal', adjustable='datalim')
+        self.ax.axis('off')  # Supprime axes, ticks, cadre, etc.
+        self.ax.grid(False)
+        self.ax.set_title("")
+        self.ax.legend_ = None
 
-            if parsed is None or parsed['command'] is None:
-                # Map this G-code line to an empty list of artists if it's just a comment or empty
-                self.gcode_line_map[i] = len(self.plotted_elements)
-                self.plotted_elements.append([]) 
-                continue
+        # Supprime tout ce qui reste
+        self.ax.xaxis.set_visible(False)
+        self.ax.yaxis.set_visible(False)
+        self.ax.set_xticks([])
+        self.ax.set_yticks([])
 
-            command = parsed['command']
-            target_x = parsed['X'] if parsed['X'] is not None else current_x
-            target_y = parsed['Y'] if parsed['Y'] is not None else current_y
+        # Ajoute deux flèches pour X et Y depuis l'origine
+        arrow_len = 10  # Ajuste la longueur selon ton échelle
+        self.ax.annotate('', xy=(arrow_len, 0), xytext=(0, 0),
+                         arrowprops=dict(facecolor='black', width=1.5, headwidth=8))
+        self.ax.annotate('', xy=(0, arrow_len), xytext=(0, 0),
+                         arrowprops=dict(facecolor='black', width=1.5, headwidth=8))
+        # Labels X et Y
+        self.ax.text(arrow_len + 1, 0, "X", fontsize=10, va='center', ha='left')
+        self.ax.text(0, arrow_len + 1, "Y", fontsize=10, va='bottom', ha='center')
 
-            current_plotted_artists = []
+   
+    def _on_scroll(self, event):
+        if event.xdata is None or event.ydata is None:
+            return  # souris en dehors du graphe
 
-            if not start_point_marked:
-                # Removed label argument from plot to prevent it from showing in a legend
-                artist_start_marker = self.ax.plot(current_x, current_y, 'o', color='gold', markersize=10)[0]
-                # Removed text labels for clarity
-                # artist_start_text = self.ax.text(current_x + 0.05, current_y + 0.05, 
-                #                                  f'D(X:{current_x:.2f},Y:{current_y:.2f}) - Ligne 1', 
-                #                                  color='gold', fontsize=8, ha='left', va='bottom')
-                current_plotted_artists.extend([artist_start_marker]) # Only marker
-                start_point_marked = True
+        base_scale = 1.2  # facteur de zoom (zoom in/out)
+        scale = base_scale if event.step < 0 else 1 / base_scale
 
-            if command == 'G00':
-                line_artist = self.ax.plot([current_x, target_x], [current_y, target_y], 'r--', alpha=0.7)[0]
-                marker_artist = self.ax.plot(target_x, target_y, 'ro', markersize=4)[0]
-                # Removed text labels for clarity
-                # text_artist = self.ax.text(target_x + 0.05, target_y + 0.05, 
-                #                            f'G00 (Ligne {i+1}){dxf_id_label}\n'
-                #                            f'Départ(X:{current_x:.2f},Y:{current_y:.2f})\n'
-                #                            f'Fin(X:{target_x:.2f},Y:{target_y:.2f})', 
-                #                            color='red', fontsize=7, ha='left', va='bottom')
-                current_plotted_artists.extend([line_artist, marker_artist]) # Only line and marker
+        xdata, ydata = event.xdata, event.ydata
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
 
-            elif command == 'G01':
-                line_artist = self.ax.plot([current_x, target_x], [current_y, target_y], 'b-', linewidth=2)[0]
-                marker_artist = self.ax.plot(target_x, target_y, 'bo', markersize=4)[0]
-                # Removed text labels for clarity
-                # text_artist = self.ax.text(target_x + 0.05, target_y + 0.05, 
-                #                            f'G01 (Ligne {i+1}){dxf_id_label}\n'
-                #                            f'Départ(X:{current_x:.2f},Y:{current_y:.2f})\n'
-                #                            f'Fin(X:{target_x:.2f},Y:{target_y:.2f})', 
-                #                            color='blue', fontsize=7, ha='left', va='bottom')
-                current_plotted_artists.extend([line_artist, marker_artist]) # Only line and marker
+        # Calcul des nouvelles limites avec effet de zoom centré sur la souris
+        new_xlim = [
+            xdata - (xdata - xlim[0]) * scale,
+            xdata + (xlim[1] - xdata) * scale
+        ]
+        new_ylim = [
+            ydata - (ydata - ylim[0]) * scale,
+            ydata + (ylim[1] - ydata) * scale
+        ]
 
-            elif command == 'G02' or command == 'G03':
-                i_offset = parsed['I'] if parsed['I'] is not None else 0.0
-                j_offset = parsed['J'] if parsed['J'] is not None else 0.0
-                center_x = current_x + i_offset
-                center_y = current_y + j_offset
+        self.ax.set_xlim(new_xlim)
+        self.ax.set_ylim(new_ylim)
+        self.canvas.draw_idle()
 
-                # --- DEBUG PROMPT: Arc Definition ---
-                print(f"\n--- DEBUG ARC (Ligne G-code {i+1}) ---")
-                print(f"   Commande: {command}")
-                print(f"   Point de départ (current): ({current_x:.4f}, {current_y:.4f})")
-                print(f"   Point d'arrivée (target): ({target_x:.4f}, {target_y:.4f})")
-                print(f"   Offsets I,J: ({i_offset:.4f}, {j_offset:.4f})")
-                print(f"   Centre de l'arc (calculé): ({center_x:.4f}, {center_y:.4f})")
+    def _on_button_press(self, event):
+        if event.button == 1 and event.xdata is not None and event.ydata is not None:
+            self._pan_start = (event.xdata, event.ydata)
+            self._xlim_at_press = self.ax.get_xlim()
+            self._ylim_at_press = self.ax.get_ylim()
 
-                # Calculate radius from start point to center
-                radius = math.hypot(current_x - center_x, current_y - center_y)
-                print(f"   Rayon (calculé depuis le départ): {radius:.4f}")
+    def _on_button_release(self, event):
+        if event.button == 1:
+            self._pan_start = None
 
-                is_start_end_same = math.hypot(target_x - current_x, target_y - current_y) < self.connection_tolerance
+    def _on_motion(self, event):
+        if self._pan_start is None or event.xdata is None or event.ydata is None:
+            return
 
-                start_angle_rad = math.atan2(current_y - center_y, current_x - center_x)
-                end_angle_rad = math.atan2(target_y - center_y, target_x - center_x)
+        dx = event.xdata - self._pan_start[0]
+        dy = event.ydata - self._pan_start[1]
 
-                # --- DEBUG PROMPT: Initial Angles ---
-                print(f"   Angle de départ (start_angle_rad - atan2 brut): {math.degrees(start_angle_rad):.2f}° ({start_angle_rad:.4f} rad)")
-                print(f"   Angle de fin (end_angle_rad - atan2 brut): {math.degrees(end_angle_rad):.2f}° ({end_angle_rad:.4f} rad)")
+        new_xlim = (self._xlim_at_press[0] - dx, self._xlim_at_press[1] - dx)
+        new_ylim = (self._ylim_at_press[0] - dy, self._ylim_at_press[1] - dy)
 
-                # Handle full circles vs. partial arcs
-                if is_start_end_same and radius > self.connection_tolerance:
-                    print("   Détecté: Cercle Complet (départ=arrivée, rayon > 0).")
-                    if command == 'G02': # CW full circle
-                        end_angle_rad = start_angle_rad - (2 * math.pi)
-                    else: # G03 - CCW full circle
-                        end_angle_rad = start_angle_rad + (2 * math.pi)
-                elif is_start_end_same and radius <= self.connection_tolerance:
-                    print("   Arc Vraiment Dégénéré: Point de départ et d'arrivée sont identiques et rayon nul (ou très proche).")
-                    point_artist = self.ax.plot(current_x, current_y, 'o', color='gray', markersize=4)[0]
-                    # Removed text label for clarity
-                    # text_artist = self.ax.text(current_x + 0.05, current_y + 0.05,
-                    #                                    f'Arc Dégénéré (Ligne {i+1}){dxf_id_label}\n'
-                    #                                    f'(X:{current_x:.2f},Y:{current_y:.2f})',
-                    #                                    color='gray', fontsize=7, ha='left', va='bottom')
-                    current_plotted_artists.extend([point_artist]) # Only marker
-                    self.gcode_line_map[i] = len(self.plotted_elements)
-                    self.plotted_elements.append(current_plotted_artists)
+        self.ax.set_xlim(new_xlim)
+        self.ax.set_ylim(new_ylim)
+        self.canvas.draw_idle()
+
+    def draw_gcode_path(self, segments: List[Dict]):
+        """
+        Dessine le chemin G-code sur le graphique Matplotlib.
+        segments: Liste de dictionnaires, chacun décrivant un segment (ligne, arc, cercle).
+                Chaque dict doit contenir 'type', 'coords', 'color', 'original_id'.
+                'coords' varie selon le type.
+                Pour les arcs, 'direction_reversed' peut être présent.
+        """
+        print(f"[INFO] Appel de draw_gcode_path avec {len(segments)} segments.")
+        self.ax.clear()
+        self._configure_plot()
+
+        self.path_artists.clear()
+        self.original_artist_colors.clear()
+
+        all_x = []
+        all_y = []
+
+        for segment in segments:
+            seg_type = segment.get('type')
+            coords = segment.get('coords', {})
+            color = segment.get('color', 'blue')
+            original_id = segment.get('original_id', 'unknown')
+            artist = None
+
+            is_jump = str(original_id).startswith("JUMP_TO_")  # G0?
+
+            try:
+                if seg_type == 'LINE':
+                    x1, y1 = coords['start_point']
+                    x2, y2 = coords['end_point']
+                    linestyle = '--' if is_jump else '-'
+                    linewidth = 1 if is_jump else 2
+                    line_color = 'gray' if is_jump else color
+
+                    print(f"[DEBUG] LINE {x1, y1} → {x2, y2} | jump={is_jump}")
+                    artist = Line2D([x1, x2], [y1, y2], color=line_color, linestyle=linestyle, linewidth=linewidth)
+                    self.ax.add_line(artist)
+                    all_x.extend([x1, x2])
+                    all_y.extend([y1, y2])
+
+                elif seg_type == 'ARC':
+                    center_x, center_y = coords['center']
+                    radius = coords['radius']
+                    start_angle = coords['start_angle'] % 360
+                    end_angle = coords['end_angle'] % 360
+                    direction_reversed = segment.get('direction_reversed', False)
+
+                    if direction_reversed:  # G3
+                        theta1, theta2 = start_angle, end_angle
+                        if theta2 <= theta1:
+                            theta2 += 360
+                    else:  # G2
+                        theta1, theta2 = start_angle, end_angle
+                        if theta2 >= theta1:
+                            theta2 -= 360
+
+                    print(f"[DEBUG] ARC center=({center_x}, {center_y}), r={radius}, θ=({theta1}→{theta2}), reversed={direction_reversed}")
+                    artist = patches.Arc((center_x, center_y), 2 * radius, 2 * radius,
+                                        angle=0, theta1=theta1, theta2=theta2, color=color,
+                                        linewidth=2, fill=False)
+                    self.ax.add_patch(artist)
+                    x1, y1 = coords['start_point']
+                    x2, y2 = coords['end_point']
+                    all_x.extend([x1, x2])
+                    all_y.extend([y1, y2])
+
+                elif seg_type == 'CIRCLE':
+                    center_x, center_y = coords['center']
+                    radius = coords['radius']
+                    print(f"[DEBUG] CIRCLE center=({center_x}, {center_y}), r={radius}")
+                    artist = patches.Circle((center_x, center_y), radius, color=color, fill=False, linewidth=2)
+                    self.ax.add_patch(artist)
+                    all_x.extend([center_x - radius, center_x + radius])
+                    all_y.extend([center_y - radius, center_y + radius])
+
+                else:
+                    print(f"[WARNING] Type de segment inconnu: {seg_type}")
                     continue
 
-                else: # Partial arc, ensure correct sweep direction
-                    angle_diff = end_angle_rad - start_angle_rad
+                if artist:
+                    if original_id not in self.path_artists:
+                        self.path_artists[original_id] = []
+                    self.path_artists[original_id].append(artist)
 
-                    if command == 'G02': # Clockwise (CW)
-                        if angle_diff > self.connection_tolerance:
-                            end_angle_rad -= 2 * math.pi
-                            print(f"   Ajustement G02 (CCW -> CW): end_angle_rad = {math.degrees(end_angle_rad):.2f}°")
-                        elif angle_diff < -2*math.pi + self.connection_tolerance:
-                            end_angle_rad += 2 * math.pi
-                            print(f"   Ajustement G02 (trop CCW -> CW): end_angle_rad = {math.degrees(end_angle_rad):.2f}°")
+                    if isinstance(artist, Line2D):
+                        self.original_artist_colors[artist] = {'linecolor': artist.get_color()}
+                    elif isinstance(artist, patches.Patch):
+                        self.original_artist_colors[artist] = {
+                            'facecolor': artist.get_facecolor(),
+                            'edgecolor': artist.get_edgecolor()
+                        }
 
-                    else: # G03 - Counter-clockwise (CCW)
-                        if angle_diff < -self.connection_tolerance:
-                            end_angle_rad += 2 * math.pi
-                            print(f"   Ajustement G03 (CW -> CCW): end_angle_rad = {math.degrees(end_angle_rad):.2f}°")
-                        elif angle_diff > 2*math.pi - self.connection_tolerance:
-                            end_angle_rad -= 2 * math.pi
-                            print(f"   Ajustement G03 (trop CW -> CCW): end_angle_rad = {math.degrees(end_angle_rad):.2f}°")
+            except Exception as e:
+                print(f"[ERROR] Exception pour {seg_type}: {e} | segment={segment}")
 
-                angle_diff_final = end_angle_rad - start_angle_rad
-                print(f"   Balayage final (end - start): {math.degrees(angle_diff_final):.2f}° ({angle_diff_final:.4f} rad)")
-                
-                print(f"   Angle de départ (final pour plot): {math.degrees(start_angle_rad):.2f}° ({start_angle_rad:.4f} rad)")
-                print(f"   Angle de fin (final pour plot, après ajustement): {math.degrees(end_angle_rad):.2f}° ({end_angle_rad:.4f} rad)")
-                print(f"   Balayage final (end - start): {math.degrees(end_angle_rad - start_angle_rad):.2f}° ({end_angle_rad - start_angle_rad:.4f} rad)")
+        if all_x and all_y:
+            min_x, max_x = min(all_x), max(all_x)
+            min_y, max_y = min(all_y), max(all_y)
+            padding = max((max_x - min_x) * 0.1, (max_y - min_y) * 0.1, 10)
+            self.ax.set_xlim(min_x - padding, max_x + padding)
+            self.ax.set_ylim(min_y - padding, max_y + padding)
+            self.ax.set_aspect('equal')
+        else:
+            self.ax.set_xlim(-100, 100)
+            self.ax.set_ylim(-100, 100)
 
-                num_arc_points = 50
-                angles = [start_angle_rad + (end_angle_rad - start_angle_rad) * t / num_arc_points for t in range(num_arc_points + 1)]
-                
-                arc_x = [center_x + radius * math.cos(angle) for angle in angles]
-                arc_y = [center_y + radius * math.sin(angle) for angle in angles]
-
-                if (abs(arc_x[-1] - target_x) > self.connection_tolerance or
-                    abs(arc_y[-1] - target_y) > self.connection_tolerance):
-                    print(f"   ATTENTION: Ajustement final du point d'arrivée de l'arc (précision): "
-                          f"({arc_x[-1]:.4f}, {arc_y[-1]:.4f}) -> ({target_x:.4f}, {target_y:.4f})")
-                    arc_x[-1] = target_x
-                    arc_y[-1] = target_y
-                
-                print(f"   Nombre de points de l'arc générés : {len(arc_x)}")
-                if len(arc_x) > 1:
-                    print(f"   Premier point de l'arc: ({arc_x[0]:.4f}, {arc_y[0]:.4f})")
-                    print(f"   Dernier point de l'arc: ({arc_x[-1]:.4f}, {arc_y[-1]:.4f})")
-                    print(f"   Distance entre le premier et le dernier point (théorique) : {math.hypot(arc_x[-1] - arc_x[0], arc_y[-1] - arc_y[0]):.4f}")
-                    print(f"   Distance entre le premier point et le point de départ G-code : {math.hypot(arc_x[0] - current_x, arc_y[0] - current_y):.4f}")
-                    print(f"   Distance entre le dernier point et le point d'arrivée G-code : {math.hypot(arc_x[-1] - target_x, arc_y[-1] - target_y):.4f}")
-                else:
-                    print("   L'arc ne contient pas assez de points pour un tracé significatif.")
+        self.canvas.draw_idle()
+        logging.info(f"Dessin de {len(segments)} segments sur le visualiseur.")
 
 
-                line_color = 'g-' if command == 'G02' else 'c-'
-                marker_color = 'go' if command == 'G02' else 'co'
-                # Removed labels, so these variables are no longer used for the plot label itself
-                # label_text = 'G02 (Circulaire CW)' if command == 'G02' else 'G03 (Circulaire CCW)' 
-                # text_color = 'green' if command == 'G02' else 'cyan'
-
-                line_artist = self.ax.plot(arc_x, arc_y, line_color, linewidth=2)[0]
-                
-                center_marker_artist = self.ax.plot(center_x, center_y, 'x', color='purple', markersize=8)[0]
-                
-                target_marker_artist = self.ax.plot(target_x, target_y, marker_color, markersize=4)[0]
-                
-                current_plotted_artists.extend([line_artist, center_marker_artist, target_marker_artist])
-            
-            self.gcode_line_map[i] = len(self.plotted_elements)
-            self.plotted_elements.append(current_plotted_artists)
-
-            current_x, current_y = target_x, target_y
-            end_point_of_path = (current_x, current_y)
-        
-        if end_point_of_path[0] is not None:
-            artist_end_marker = self.ax.plot(end_point_of_path[0], end_point_of_path[1], 's', color='darkred', markersize=10)[0]
-            current_plotted_artists.extend([artist_end_marker]) # Add end marker to the last set of plotted artists if any
-            # For the end marker, we'll store it separately if there were no previous plotted artists,
-            # to ensure it's still accessible for highlighting.
-            if i not in self.gcode_line_map or not self.plotted_elements[self.gcode_line_map[i]]:
-                self.gcode_line_map[i] = len(self.plotted_elements)
-                self.plotted_elements.append([artist_end_marker])
-            else:
-                 self.plotted_elements[self.gcode_line_map[i]].append(artist_end_marker)
-
-
-        # self.ax.legend(loc='best', fontsize=9) # Removed legend
-        self.ax.figure.canvas.draw_idle()
-
-    def clear_highlights(self):
+    def highlight_dxf_entities_by_ids(self, selected_dxf_ids: List[str]):
         """
-        Resets all current highlights on the plot elements.
+        Met en surbrillance les entités DXF spécifiées par leurs IDs.
+        selected_dxf_ids: Liste des original_id des entités à mettre en surbrillance.
         """
-        for element in self.current_highlighted_elements:
-            if element in self._original_colors:
-                if isinstance(element, plt.Line2D):
-                    element.set_color(self._original_colors[element])
-                    if element in self._original_linewidths:
-                        element.set_linewidth(self._original_linewidths[element])
-                    if element in self._original_markersizes and hasattr(element, 'set_markersize'):
-                        element.set_markersize(self._original_markersizes[element])
-                elif isinstance(element, plt.Text): # Text labels are removed, so this branch won't be hit for main plotting, but keep for highlight
-                    element.set_color(self._original_colors[element])
-                elif isinstance(element, plt.Artist): # Handles markers, etc.
-                    if hasattr(element, 'get_markerfacecolor') and element.get_markerfacecolor() not in ['none', (0.0, 0.0, 0.0, 0.0)]:
-                        element.set_markerfacecolor(self._original_colors[element])
-                    if hasattr(element, 'get_markeredgecolor'):
-                        element.set_markeredgecolor(self._original_colors[element])
-                    if hasattr(element, 'set_markersize') and element in self._original_markersizes:
-                        element.set_markersize(self._original_markersizes[element])
-                            
-        self.current_highlighted_elements = []
-        self._original_colors = {}
-        self._original_linewidths = {}
-        self._original_markersizes = {}
-        self.ax.figure.canvas.draw_idle()
+        highlight_color = 'magenta' # Couleur de surbrillance
+        default_linewidth = 2
+        highlight_linewidth = 4 # Rendre la ligne plus épaisse pour la surbrillance
 
+        logging.info(f"Mise en surbrillance des IDs DXF: {selected_dxf_ids}")
 
-    def highlight_elements(self, gcode_line_index, color='yellow', linewidth_scale=2.0, marker_size_scale=1.5):
-        """
-        Highlights the plot elements corresponding to a specific G-code line.
-        Resets previous highlights.
-        """
-        self.clear_highlights() # Call the new clear_highlights method
+        # D'abord, restaurer la couleur de tous les artistes
+        for artist, colors_dict in self.original_artist_colors.items():
+            if isinstance(artist, Line2D):
+                artist.set_color(colors_dict['linecolor'])
+                artist.set_linewidth(default_linewidth)
+            elif isinstance(artist, patches.Patch): # Covers Circle and Arc
+                artist.set_facecolor(colors_dict['facecolor'])
+                artist.set_edgecolor(colors_dict['edgecolor'])
+                artist.set_linewidth(default_linewidth)
 
-        if gcode_line_index in self.gcode_line_map:
-            plot_elements_idx = self.gcode_line_map[gcode_line_index]
-            
-            if plot_elements_idx < len(self.plotted_elements):
-                artists_to_highlight = self.plotted_elements[plot_elements_idx]
-                
-                for element in artists_to_highlight:
-                    if isinstance(element, plt.Line2D):
-                        self._original_colors[element] = element.get_color()
-                        self._original_linewidths[element] = element.get_linewidth()
-                        self._original_markersizes[element] = element.get_markersize() if hasattr(element, 'get_markersize') else 0
-                        
-                        element.set_color(color)
-                        element.set_linewidth(element.get_linewidth() * linewidth_scale)
-                        if hasattr(element, 'set_markersize') and element.get_markersize() > 0:
-                            element.set_markersize(element.get_markersize() * marker_size_scale)
-                    elif isinstance(element, plt.Text): # This will only apply if text labels are added back or for specific debug text
-                        self._original_colors[element] = element.get_color()
-                        element.set_color(color)
-                    elif isinstance(element, plt.Artist):
-                        if hasattr(element, 'get_markerfacecolor') and element.get_markerfacecolor() not in ['none', (0.0, 0.0, 0.0, 0.0)]:
-                            self._original_colors[element] = element.get_markerfacecolor()
-                            element.set_markerfacecolor(color)
-                        elif hasattr(element, 'get_markeredgecolor'):
-                            self._original_colors[element] = element.get_markeredgecolor()
-                            element.set_markeredgecolor(color)
-                        
-                        if hasattr(element, 'set_markersize') and hasattr(element, 'get_markersize'):
-                            self._original_markersizes[element] = element.get_markersize()
-                            element.set_markersize(element.get_markersize() * marker_size_scale)
-                    self.current_highlighted_elements.append(element)
-        self.ax.figure.canvas.draw_idle()
+        # Ensuite, appliquer la surbrillance aux artistes sélectionnés
+        for dxf_id in selected_dxf_ids:
+            artists_for_id = self.path_artists.get(dxf_id, [])
+            for artist in artists_for_id:
+                if isinstance(artist, Line2D):
+                    artist.set_color(highlight_color)
+                    artist.set_linewidth(highlight_linewidth)
+                elif isinstance(artist, patches.Patch): # Covers Circle and Arc
+                    # Convertir la couleur de surbrillance en RGBA et ajuster l'alpha
+                    rgba_color = to_rgba(highlight_color)
+                    transparent_highlight_color = (rgba_color[0], rgba_color[1], rgba_color[2], 0.5)
+                    artist.set_facecolor(transparent_highlight_color) # Utiliser la couleur transparente pour le remplissage
+                    artist.set_edgecolor(highlight_color) # Garder la couleur opaque pour les bords
+                    artist.set_linewidth(highlight_linewidth)
+        self.canvas.draw_idle()
+
+    def _fit_plot_to_content(self):
+        """Ajuste les limites du graphique pour occuper ~90% de la surface du widget."""
+        all_x = []
+        all_y = []
+        # Récupère tous les points extrêmes des segments
+        for seg in self.gcode_lines:
+            if seg['type'] == 'LINE':
+                all_x.extend([seg['start_x'], seg['end_x']])
+                all_y.extend([seg['start_y'], seg['end_y']])
+            elif seg['type'] == 'ARC':
+                # Ajoute le centre et le rayon pour estimer le bounding box de l'arc
+                cx, cy = seg['center_x'], seg['center_y']
+                r = seg['radius']
+                all_x.extend([cx - r, cx + r])
+                all_y.extend([cy - r, cy + r])
+            elif seg['type'] == 'CIRCLE':
+                cx, cy = seg['center_x'], seg['center_y']
+                r = seg['radius']
+                all_x.extend([cx - r, cx + r])
+                all_y.extend([cy - r, cy + r])
+        if not all_x or not all_y:
+            self.ax.set_xlim(-10, 10)
+            self.ax.set_ylim(-10, 10)
+            return
+
+        min_x, max_x = min(all_x), max(all_x)
+        min_y, max_y = min(all_y), max(all_y)
+        dx = max_x - min_x
+        dy = max_y - min_y
+        # Padding de 5% de chaque côté
+        pad_x = dx * 0.05 if dx > 0 else 1.0
+        pad_y = dy * 0.05 if dy > 0 else 1.0
+        self.ax.set_xlim(min_x - pad_x, max_x + pad_x)
+        self.ax.set_ylim(min_y - pad_y, max_y + pad_y)
+        self.canvas.draw_idle()
