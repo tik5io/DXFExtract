@@ -2,7 +2,6 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import logging
 import os
-# Assurez-vous que ces modules sont disponibles et correctement implémentés
 from dxf_processor import DxfProcessor
 from gcode_visualizer import GcodeVisualizer
 from typing import List, Dict, Tuple, Set, Any
@@ -25,7 +24,6 @@ class AppGUI:
         self.ordered_trajectories: List[List[Dict]] = [] # Liste des listes de segments ordonnés
         self.isolated_circles: List[Dict] = []
 
-        # --- NOUVELLE ARCHITECTURE : État de la sélection centralisé ---
         self.selected_dxf_ids: Set[str] = set() # Utiliser un set pour des recherches rapides et éviter les doublons
         self.dxf_id_to_line_map: Dict[str, List[int]] = {} # Map: original_id -> [line_idx, ...]
         # Map: original_dxf_id_segment -> parent_trajectory_tree_id (e.g., 'traj_0', 'isolated_circles_parent')
